@@ -22,10 +22,12 @@ echo Starting analyzer...
 echo.
 
 REM Run the analyzer
-python "%~dp0analyzer.py"
-
-if errorlevel 1 (
-    echo.
-    echo Something went wrong. Press any key to close.
-    pause >nul
+REM Prefer pythonw (no console) if available, otherwise fall back to python.
+where pythonw.exe >nul 2>&1 && (
+    start "" pythonw "%~dp0analyzer.py"
+) || (
+    start "" python "%~dp0analyzer.py"
 )
+
+REM Exit the batch immediately so the launching window closes.
+exit /b 0
