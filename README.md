@@ -81,6 +81,7 @@ The analyzer examines minidump files for:
 - **Resource Paths**: Identifies FiveM resource folders in crash stack traces
 - **Module Analysis**: Checks loaded DLLs and memory regions
 - **Native Filters**: Removes false positives from system paths
+- **Manifest Handling**: Treats fxmanifest.lua/__resource.lua as metadata only (not crash-causing scripts)
 
 ### Memory Leak Detection
 

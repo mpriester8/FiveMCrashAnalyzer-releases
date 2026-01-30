@@ -432,6 +432,12 @@ class MemoryAnalyzer:
         'dui-runtime.js',
     }
 
+    # Resource manifest files are metadata, not executable scripts.
+    MANIFEST_FILES = {
+        'fxmanifest.lua',
+        '__resource.lua',
+    }
+
     # Path segments that are NOT valid FiveM resource names (system/internal paths)
     IGNORED_PATH_SEGMENTS = {
         # FiveM/CitizenFX internal paths
@@ -1498,11 +1504,19 @@ class MemoryAnalyzer:
             self.result.resources[resource_name] = ResourceInfo(name=resource_name)
 
         info = self.result.resources[resource_name]
-        info.evidence_count += 1
-        info.evidence_types.add(evidence.evidence_type)
 
-        if evidence.script_name and evidence.script_name not in info.scripts:
-            info.scripts.append(evidence.script_name)
+        is_manifest = (
+            evidence.evidence_type == EvidenceType.MANIFEST_REFERENCE
+            or (evidence.script_name and evidence.script_name.lower() in self.MANIFEST_FILES)
+        )
+
+        # Manifest files indicate presence only, not a crash cause.
+        if not is_manifest:
+            info.evidence_count += 1
+            info.evidence_types.add(evidence.evidence_type)
+
+            if evidence.script_name and evidence.script_name not in info.scripts:
+                info.scripts.append(evidence.script_name)
 
         if evidence.file_path:
             info.path = evidence.file_path
@@ -1511,7 +1525,7 @@ class MemoryAnalyzer:
                 info.all_paths.append(evidence.file_path)
 
         # Track context details for better reporting
-        if evidence.context and len(evidence.context) > 5:
+        if not is_manifest and evidence.context and len(evidence.context) > 5:
             context_entry = f"[{evidence.evidence_type.name}] {evidence.context[:150]}"
             if context_entry not in info.context_details and len(info.context_details) < 10:
                 info.context_details.append(context_entry)
@@ -1529,7 +1543,6 @@ class MemoryAnalyzer:
             EvidenceType.EXCEPTION_ADDRESS: 8.0,
             EvidenceType.SCRIPT_PATH: 5.0,
             EvidenceType.THREAD_STACK: 6.0,
-            EvidenceType.MANIFEST_REFERENCE: 3.0,
             EvidenceType.EVENT_HANDLER: 2.0,
             EvidenceType.NATIVE_CALL: 2.0,
             EvidenceType.MEMORY_REGION: 1.0,
@@ -1537,6 +1550,9 @@ class MemoryAnalyzer:
         }
 
         for evidence in self.result.all_evidence:
+            if evidence.evidence_type == EvidenceType.MANIFEST_REFERENCE:
+                # Manifest references only show resource presence, not crash cause.
+                continue
             resource = evidence.resource_name or evidence.script_name
             if not resource:
                 continue
@@ -1577,8 +1593,13 @@ class MemoryAnalyzer:
                 self._redistribute_blame_from_internal(resource_name, scores)
 
         # Sort resources by score
+        scored_resources = [
+            resource for resource in self.result.resources.values()
+            if scores.get(resource.name, 0) > 0
+        ]
+
         sorted_resources = sorted(
-            self.result.resources.values(),
+            scored_resources,
             key=lambda r: scores.get(r.name, 0),
             reverse=True
         )
