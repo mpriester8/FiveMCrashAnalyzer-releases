@@ -2,15 +2,28 @@
 
 This module provides advanced memory analysis capabilities to pinpoint
 exact scripts, resources, and code paths causing crashes in FiveM.
+
+Performance optimizations:
+- Memoryview for efficient memory access
+- Deduplication to prevent redundant processing
+- Early termination when sufficient evidence is found
+- Sampled analysis for very large dumps
+- Pre-compiled regex patterns at class level
+- Optional multi-process chunk analysis (uses CPU cores; set USE_PARALLEL_CHUNKS=False
+  or limit MAX_PARALLEL_WORKERS to reduce memory use). GPU acceleration would require
+  external libraries (e.g. CUDA-based pattern matching) and is not implemented.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import struct
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple, Set, Callable
 from enum import Enum
 
 # Optional minidump library
@@ -20,6 +33,54 @@ try:
 except ImportError:
     MinidumpFile = None
     HAS_MINIDUMP = False
+
+# #region agent log
+_DEBUG_LOG_PATH = r"c:\Users\mprie_9uaaf\Desktop\Coding Projects\CrashAnalyzer\.cursor\debug.log"
+
+
+def _dlog(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: Dict[str, Any],
+    run_id: str = "run1",
+) -> None:
+    try:
+        os.makedirs(os.path.dirname(_DEBUG_LOG_PATH), exist_ok=True)
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "sessionId": "debug-session",
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
+
+# #endregion
+
+
+def _process_chunk_worker(args: Tuple[bytes, int]) -> "DeepAnalysisResult":
+    """Run analysis passes on a single chunk in a worker process (for CPU parallelism).
+    
+    Must be a module-level function so it can be pickled for ProcessPoolExecutor.
+    Returns a DeepAnalysisResult to be merged by the main process.
+    """
+    chunk_bytes, chunk_offset = args
+    ma = MemoryAnalyzer()  # No callbacks in worker
+    ma.result = DeepAnalysisResult()
+    ma._evidence_seen = set()
+    ma._run_analysis_passes(chunk_bytes, chunk_offset)
+    return ma.result
 
 
 class EvidenceType(Enum):
@@ -35,6 +96,7 @@ class EvidenceType(Enum):
     MANIFEST_REFERENCE = "manifest_reference"
     NATIVE_CALL = "native_call"
     EVENT_HANDLER = "event_handler"
+    HANDLE_PATH = "handle_path"  # Resource path from open file handle at crash
 
 
 @dataclass
@@ -86,6 +148,8 @@ class ResourceInfo:
     all_paths: List[str] = field(default_factory=list)
     # Detailed context from evidence (error messages, stack traces, etc.)
     context_details: List[str] = field(default_factory=list)
+    # Likely script file from ERROR_MESSAGE evidence (e.g. client.lua) for report display
+    likely_script: Optional[str] = None
 
 
 @dataclass
@@ -206,8 +270,14 @@ class DeepAnalysisResult:
     # Lua stack traces reconstructed from memory
     lua_stacks: List[List[LuaStackFrame]] = field(default_factory=list)
 
+    # Resources involved per Lua stack (same index as lua_stacks)
+    lua_stack_resources: List[List[str]] = field(default_factory=list)
+
     # JS stack traces
     js_stacks: List[str] = field(default_factory=list)
+
+    # Resources involved per JS stack (same index as js_stacks)
+    js_stack_resources: List[List[str]] = field(default_factory=list)
 
     # Resources found in memory
     resources: Dict[str, ResourceInfo] = field(default_factory=dict)
@@ -231,6 +301,10 @@ class DeepAnalysisResult:
     # Analysis metadata
     analysis_complete: bool = False
     errors: List[str] = field(default_factory=list)
+
+    # Tie-breaking / confidence: when top two suspects have close scores
+    primary_suspect_secondary: Optional[str] = None  # name of second-place when evidence is ambiguous
+    primary_suspect_confidence: str = "medium"  # "high" | "medium" | "low" for report wording
 
     # Standard Minidump Data
     system_info: Dict[str, Any] = field(default_factory=dict)
@@ -267,6 +341,49 @@ class DeepAnalysisResult:
 
     # Assertion info
     assertion_info: Dict[str, str] = field(default_factory=dict)
+
+    # ===== MEMORY LEAK ANALYSIS DATA =====
+    # Entity creation/deletion tracking
+    entity_creations: List[Tuple[str, int]] = field(default_factory=list)  # (native_name, memory_offset)
+    entity_deletions: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Timer tracking
+    timers_created: List[Tuple[str, int]] = field(default_factory=list)  # (pattern, memory_offset)
+    
+    # Event handler tracking
+    event_handlers_registered: List[Tuple[str, int]] = field(default_factory=list)
+    event_handlers_removed: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Memory allocation tracking (C/C++ level)
+    memory_allocations: List[Tuple[str, int]] = field(default_factory=list)
+    memory_frees: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Memory leak indicators found
+    memory_leak_indicators: List[Tuple[str, str, int]] = field(default_factory=list)  # (message, type, offset)
+    
+    # Pool/resource exhaustion indicators
+    pool_exhaustion_indicators: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Database query patterns found
+    database_patterns: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # NUI/CEF patterns found
+    nui_patterns: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Network sync patterns
+    network_patterns: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # State bag patterns
+    statebag_patterns: List[Tuple[str, int]] = field(default_factory=list)
+
+    # For full_analysis: raw strings and module names (avoids re-reading dump)
+    raw_strings: List[str] = field(default_factory=list)
+    module_names: List[str] = field(default_factory=list)
+
+    # JavaScriptData stream (20) - V8/JS context when present
+    javascript_data: Optional[Dict[str, Any]] = None
+    # ProcessVmCounters stream (22) - VM usage at crash
+    process_vm_counters: Optional[Dict[str, Any]] = None
 
 
 class MemoryAnalyzer:
@@ -365,7 +482,158 @@ class MemoryAnalyzer:
             rb'(?:RegisterCommand|TriggerEvent\s*\(\s*["\']chat:addSuggestion["\'])\s*\(\s*["\']([A-Za-z0-9_\-]+)["\']',
             re.IGNORECASE
         ),
+        # Server.cfg / server config - ensure/start resource name
+        'ensure_start': re.compile(
+            rb'(?:ensure|start)\s+([A-Za-z0-9_\-]{2,64})\s*(?:$|#|\r|\n)',
+            re.IGNORECASE
+        ),
+        # Server resources path: resources/resname or resources\resname
+        'server_resources_path': re.compile(
+            rb'resources[/\\]([A-Za-z0-9_\-]{2,64})(?:[/\\]|$)',
+            re.IGNORECASE
+        ),
+        # GetCurrentResourceName / GetInvokingResource - resource name often nearby as string
+        'get_current_resource': re.compile(
+            rb'(?:GetCurrentResourceName|GetInvokingResource)\s*\(\s*\)',
+            re.IGNORECASE
+        ),
+        # ===== MEMORY LEAK DETECTION PATTERNS =====
+        # Entity creation natives (common leak sources)
+        'entity_creation': re.compile(
+            rb'(CreateVehicle|CreatePed|CreateObject|CreatePickup|CreateBlip|'
+            rb'AddBlipForCoord|AddBlipForEntity|CreateCam|CreateCamWithParams|'
+            rb'NetworkCreateSynchronisedScene|CreateCheckpoint|'
+            rb'CreateVehicleServerSetter|CreateObjectNoOffset|CreatePedInsideVehicle)',
+            re.IGNORECASE
+        ),
+        # Entity deletion natives (check if balanced with creation)
+        'entity_deletion': re.compile(
+            rb'(DeleteEntity|DeleteVehicle|DeletePed|DeleteObject|RemoveBlip|'
+            rb'DestroyCam|DestroyAllCams|DeleteCheckpoint|SetEntityAsNoLongerNeeded|'
+            rb'SetVehicleAsNoLongerNeeded|SetPedAsNoLongerNeeded|SetObjectAsNoLongerNeeded)',
+            re.IGNORECASE
+        ),
+        # Timer creation (potential leaks if not cancelled)
+        'timer_creation': re.compile(
+            rb'(SetTimeout|setInterval|setTimeout|SetInterval|Citizen\.SetTimeout)',
+            re.IGNORECASE
+        ),
+        # Event handler registration (check for cleanup)
+        'event_registration': re.compile(
+            rb'(AddEventHandler|RegisterNetEvent|RegisterServerEvent|RegisterNUICallback|'
+            rb'on\s*\(\s*["\'][A-Za-z0-9:_\-]+["\']|RegisterCommand)',
+            re.IGNORECASE
+        ),
+        # Event handler removal
+        'event_removal': re.compile(
+            rb'(RemoveEventHandler|off\s*\(\s*["\'][A-Za-z0-9:_\-]+["\'])',
+            re.IGNORECASE
+        ),
+        # Memory allocation patterns (C/C++ level)
+        'memory_alloc': re.compile(
+            rb'(HeapAlloc|VirtualAlloc|malloc|calloc|realloc|new\s+\w+|'
+            rb'GlobalAlloc|LocalAlloc|CoTaskMemAlloc)',
+            re.IGNORECASE
+        ),
+        # Memory free patterns
+        'memory_free': re.compile(
+            rb'(HeapFree|VirtualFree|free|delete\s+|delete\[\]|'
+            rb'GlobalFree|LocalFree|CoTaskMemFree)',
+            re.IGNORECASE
+        ),
+        # Pool exhaustion indicators
+        'pool_exhaustion': re.compile(
+            rb'(pool\s*(?:is\s+)?(?:full|exhausted|overflow)|'
+            rb'entity\s*(?:limit|pool)|no\s*free\s*(?:slot|entity)|'
+            rb'MAX_ENTITIES|max\s*(?:vehicle|ped|object)s?\s*(?:reached|exceeded)|'
+            rb'CPool<|rage::fwBasePool)',
+            re.IGNORECASE
+        ),
+        # Texture/streaming memory issues
+        'streaming_memory': re.compile(
+            rb'(streaming\s*memory|texture\s*(?:budget|memory|limit)|'
+            rb'grcTexture|rage::strStreamingModule|ytd\s*(?:fail|error)|'
+            rb'asset\s*(?:fail|timeout|error))',
+            re.IGNORECASE
+        ),
+        # NUI/CEF memory patterns
+        'nui_memory': re.compile(
+            rb'(NUI|CEF|CefBrowser|DUI|duiUrl|SendNUIMessage|'
+            rb'SetNuiFocus|NuiCallback|GetNuiCursorPosition)',
+            re.IGNORECASE
+        ),
+        # Thread context patterns
+        'thread_context': re.compile(
+            rb'(scrThread|GtaThread|rage::scrThread|scriptHandler|'
+            rb'CTheScripts|CScriptResource)',
+            re.IGNORECASE
+        ),
+        # Reference counting issues
+        'refcount_issue': re.compile(
+            rb'(ref\s*count|reference\s*count|AddRef|Release|strong_ptr|weak_ptr|'
+            rb'shared_ptr|unique_ptr|ref<|fwRef)',
+            re.IGNORECASE
+        ),
+        # Database/ORM patterns (ox_lib, mysql-async, etc.)
+        'database_pattern': re.compile(
+            rb'(MySQL|oxmysql|mysql-async|ghmattimysql|'
+            rb'exports\s*\[\s*["\'](?:ox|mysql|ghm)|'
+            rb'(?:SELECT|INSERT|UPDATE|DELETE)\s+(?:FROM|INTO|SET))',
+            re.IGNORECASE
+        ),
+        # State bag patterns
+        'statebag_pattern': re.compile(
+            rb'(GlobalState|LocalPlayer\.state|Player\(\d+\)\.state|'
+            rb'Entity\(\d+\)\.state|SetStateBagValue|GetStateBagValue)',
+            re.IGNORECASE
+        ),
+        # Network sync issues
+        'network_sync': re.compile(
+            rb'(NetworkRequest|NetworkGet|NetworkOverride|NetworkSetEntityInvisible|'
+            rb'SyncScene|NetworkFade|NetworkConceal|NetworkSetPropertyId|'
+            rb'OneSync|NetworkRegisterEntityAsNetworked)',
+            re.IGNORECASE
+        ),
     }
+
+    # ===== MEMORY LEAK INDICATORS =====
+    # Strings that indicate potential memory issues
+    MEMORY_LEAK_INDICATORS = [
+        # Allocation failures
+        (b'out of memory', 'oom'),
+        (b'memory allocation failed', 'alloc_fail'),
+        (b'failed to allocate', 'alloc_fail'),
+        (b'heap corruption', 'heap_corrupt'),
+        (b'double free', 'double_free'),
+        (b'use after free', 'use_after_free'),
+        (b'invalid heap', 'heap_invalid'),
+        (b'memory leak', 'leak_detected'),
+        # Pool exhaustion
+        (b'pool full', 'pool_full'),
+        (b'pool exhausted', 'pool_exhausted'),
+        (b'entity limit', 'entity_limit'),
+        (b'too many entities', 'entity_limit'),
+        (b'max vehicles', 'vehicle_limit'),
+        (b'max peds', 'ped_limit'),
+        (b'max objects', 'object_limit'),
+        # Resource issues
+        (b'resource budget', 'budget_exceeded'),
+        (b'texture budget', 'texture_budget'),
+        (b'streaming budget', 'streaming_budget'),
+        (b'asset budget', 'asset_budget'),
+        # Handle leaks
+        (b'handle leak', 'handle_leak'),
+        (b'too many handles', 'handle_limit'),
+        (b'handle count', 'handle_count'),
+        # GC issues
+        (b'gc overhead', 'gc_overhead'),
+        (b'garbage collection', 'gc_issue'),
+        # Thread issues
+        (b'thread limit', 'thread_limit'),
+        (b'too many threads', 'thread_limit'),
+        (b'stack overflow', 'stack_overflow'),
+        (b'C stack overflow', 'c_stack_overflow'),
+    ]
 
     # Lua runtime error messages - these indicate active Lua errors
     LUA_ERROR_MESSAGES = [
@@ -438,6 +706,13 @@ class MemoryAnalyzer:
         '__resource.lua',
     }
 
+    # Faulting module substrings that indicate script runtime (crash in script code, not generic native)
+    SCRIPT_RUNTIME_MODULE_SUBSTRINGS = (
+        'scripthandler',
+        'citizen-resources-',
+        'citizen-scripting',
+    )
+
     # Path segments that are NOT valid FiveM resource names (system/internal paths)
     IGNORED_PATH_SEGMENTS = {
         # FiveM/CitizenFX internal paths
@@ -445,6 +720,8 @@ class MemoryAnalyzer:
         'cache', 'caches', 'data', 'citizen', 'cfx', 'fivem', 'redm',
         'scripting', 'runtime', 'natives', 'v8', 'lua', 'mono', 'gl',
         'resources', 'resource', 'stream', 'streaming', 'files',
+        # Common resource subfolders (not resource roots)
+        'html', 'modules', 'config', 'locales',
         'fx', 'rage', 'gta', 'gtav', 'gta5', 'update', 'dlc', 'dlcpacks',
         'common', 'platform', 'x64', 'citizen-scripting', 'citizen-server-impl',
         'fxserver', 'fxdk', 'alphaware', 'canary', 'release', 'opt',
@@ -512,12 +789,89 @@ class MemoryAnalyzer:
         b'unhandled exception',
         b'stack trace',
         b'call stack',
+        # Additional crash markers
+        b'CRASH',
+        b'assertion failed',
+        b'debug assertion',
+        b'null pointer',
+        b'nullptr',
+        b'invalid pointer',
+        b'corrupted',
+        b'heap corruption',
+        b'buffer overrun',
+        b'stack buffer',
+        b'STATUS_',
+        b'0xC0000005',  # Access violation
+        b'0xC0000374',  # Heap corruption
+        b'0xC00000FD',  # Stack overflow
+        b'0x80000003',  # Breakpoint
     ]
 
-    def __init__(self):
+    # FiveM-specific crash causes
+    FIVEM_CRASH_CAUSES = [
+        (b'ERR_GFX_STATE', 'graphics_state', 'GPU/Graphics driver issue'),
+        (b'ERR_GFX_D3D_INIT', 'graphics_init', 'DirectX initialization failure'),
+        (b'ERR_GEN_INVALID', 'gen_invalid', 'General invalid state'),
+        (b'ERR_MEM_EMBEDDEDALLOC', 'memory_alloc', 'Embedded allocator failure'),
+        (b'ERR_SYS_INVALIDRESOURCE', 'invalid_resource', 'Invalid resource reference'),
+        (b'ERR_NET_', 'network', 'Network error'),
+        (b'STREAMING_', 'streaming', 'Asset streaming issue'),
+        (b'rage::atArray', 'array_overflow', 'Array bounds issue'),
+        (b'rage::fwEntity', 'entity_issue', 'Entity system issue'),
+        (b'CNetGamePlayer', 'player_issue', 'Player system issue'),
+        (b'CTaskDataInfo', 'task_issue', 'Task/AI system issue'),
+        (b'audSound', 'audio_issue', 'Audio system issue'),
+        (b'strStreamingModule', 'streaming_module', 'Streaming module issue'),
+        (b'CScriptResource', 'script_resource', 'Script resource issue'),
+    ]
+
+    def __init__(self, progress_callback=None, abort_check: Optional[Callable[[], bool]] = None):
+        """Initialize the memory analyzer.
+        
+        Args:
+            progress_callback: Optional callable(stage: str, progress: float, message: str)
+                             - stage: Current analysis stage name
+                             - progress: 0.0 to 1.0 progress within current stage  
+                             - message: Human-readable status message
+                             
+                             Example callback:
+                             def my_callback(stage, progress, message):
+                                 print(f"[{stage}] {progress*100:.0f}% - {message}")
+            abort_check: Optional callable() -> bool; if returns True, long-running
+                         loops (streaming/sampling) will stop early to avoid timeouts.
+        """
         self.result = DeepAnalysisResult()
         self._module_map: Dict[int, Tuple[int, str]] = {}  # base -> (end, name)
         self._memory_data: Dict[int, bytes] = {}  # start -> data
+        self._progress_callback = progress_callback
+        self._abort_check = abort_check
+        self._current_stage = ""
+        self._stage_progress = 0.0
+        self._last_progress_time = 0.0  # For throttling UI updates
+        self._progress_throttle_sec = 0.35  # Min interval between progress callbacks (keeps UI responsive)
+
+    def _report_progress(self, stage: str, progress: float, message: str) -> None:
+        """Report progress to callback if registered. Throttled so UI stays responsive on large files."""
+        self._current_stage = stage
+        self._stage_progress = progress
+        if self._progress_callback:
+            now = time.monotonic()
+            # Always emit completion/final updates; throttle intermediate updates
+            if progress >= 1.0 or stage == "complete" or (now - self._last_progress_time) >= self._progress_throttle_sec:
+                self._last_progress_time = now
+                try:
+                    self._progress_callback(stage, progress, message)
+                except Exception:
+                    pass  # Don't let callback errors break analysis
+
+    def _should_abort(self) -> bool:
+        """Return True if the caller requested abort (e.g. user cancel)."""
+        if self._abort_check is None:
+            return False
+        try:
+            return bool(self._abort_check())
+        except Exception:
+            return False
 
     def _obj_to_dict(self, obj: Any) -> Dict[str, Any]:
         """Convert a minidump object to a dictionary."""
@@ -537,67 +891,776 @@ class MemoryAnalyzer:
 
         return result
 
+    # Maximum evidence items to collect before stopping (performance optimization)
+    # Increased to 2000 for better coverage on large dumps
+    MAX_EVIDENCE_ITEMS = 2000
+    # Maximum dump size for full in-memory analysis (500MB) - larger dumps use streaming
+    MAX_FULL_ANALYSIS_SIZE = 500 * 1024 * 1024
+    # Chunk size for streaming analysis (64MB - fits comfortably in memory)
+    STREAM_CHUNK_SIZE = 64 * 1024 * 1024
+    # Maximum file size we'll attempt to analyze (10GB)
+    MAX_SUPPORTED_FILE_SIZE = 10 * 1024 * 1024 * 1024
+    # Use multiple CPU cores for in-memory and streaming chunk analysis (set False to reduce memory use)
+    USE_PARALLEL_CHUNKS = True
+    # Min dump size (bytes) to use parallel workers for in-memory path; below this, single-thread is faster
+    MIN_SIZE_PARALLEL_IN_MEMORY = 25 * 1024 * 1024  # 25MB
+    # Max worker processes for parallel chunks (limits memory: workers * chunk size).
+    # Lower = less spawn overhead on Windows; 4 is often a good balance.
+    MAX_PARALLEL_WORKERS = min(max(1, (os.cpu_count() or 4) - 1), 4)
+    # Process at least this many chunks (first 1GB at 64MB/chunk) before allowing early stop
+    MIN_STREAMING_CHUNKS_BEFORE_EARLY_STOP = 16
+
     def analyze_dump_deep(self, dump_path: str) -> DeepAnalysisResult:
-        """Perform deep analysis of a minidump file to pinpoint error sources."""
+        """Perform deep analysis of a minidump file to pinpoint error sources.
+        
+        Performance optimizations:
+        - Early termination when sufficient evidence is collected
+        - Streaming/chunked processing for large dumps (>500MB)
+        - Memory-mapped file access for very large dumps (>1GB)
+        - Sampled analysis for massive dumps (>2GB)
+        
+        Supports dumps up to 10GB in size.
+        
+        Progress is reported via the callback provided in __init__.
+        """
         self.result = DeepAnalysisResult()
+        self._evidence_seen: Set[str] = set()  # Deduplication cache
+        self._max_evidence = self.MAX_EVIDENCE_ITEMS
+        self._max_raw_strings = 3000
 
         if not os.path.exists(dump_path):
             self.result.errors.append(f"Dump file not found: {dump_path}")
             return self.result
 
-        try:
-            # Read raw dump data for string analysis
-            with open(dump_path, 'rb') as f:
-                raw_data = f.read()
+        if self._should_abort():
+            self.result.errors.append("Analysis cancelled before start")
+            return self.result
 
-            # Verify minidump header
-            if raw_data[:4] != b'MDMP':
+        try:
+            file_size = os.path.getsize(dump_path)
+            file_size_mb = file_size // (1024 * 1024)
+            file_size_gb = file_size / (1024 * 1024 * 1024)
+            # #region agent log
+            _dlog(
+                "H3",
+                "memory_analyzer.analyze_dump_deep.entry",
+                "dump metadata",
+                {
+                    "dump_file": os.path.basename(dump_path),
+                    "file_size": file_size,
+                    "file_size_mb": file_size_mb,
+                    "has_minidump_lib": HAS_MINIDUMP,
+                },
+            )
+            # #endregion
+            # For large files, allow more evidence and raw_strings to extract full resource info
+            ONE_GB = 1024 * 1024 * 1024
+            if file_size > ONE_GB:
+                self._max_evidence = min(5000, self.MAX_EVIDENCE_ITEMS * 2)
+                self._max_raw_strings = 5000
+            
+            self._report_progress("init", 0.0, f"Starting analysis of {file_size_mb}MB dump file")
+            
+            # Check if file is too large
+            if file_size > self.MAX_SUPPORTED_FILE_SIZE:
+                self.result.errors.append(
+                    f"Dump file too large ({file_size_gb:.1f}GB). "
+                    f"Maximum supported size is {self.MAX_SUPPORTED_FILE_SIZE // (1024*1024*1024)}GB."
+                )
+                return self.result
+
+            self._report_progress("init", 0.1, "Verifying minidump header...")
+            
+            # Verify minidump header (just read first 4 bytes)
+            with open(dump_path, 'rb') as f:
+                header = f.read(4)
+            if header != b'MDMP':
                 self.result.errors.append("Not a valid minidump file (missing MDMP header)")
                 return self.result
 
-            # Parse with minidump library if available
-            if HAS_MINIDUMP:
+            # Parse with minidump library if available (skip for large files to avoid freezes in first 1GB)
+            ONE_GB = 1024 * 1024 * 1024
+            if HAS_MINIDUMP and file_size < ONE_GB:
+                self._report_progress("structure", 0.0, "Parsing minidump structure...")
                 try:
                     md = MinidumpFile.parse(dump_path)
+                    self._report_progress("structure", 0.5, "Analyzing exception and thread info...")
                     self._analyze_minidump_structure(md)
+                    # Fallback: if full parse did not yield native stack (e.g. reader/thread layout differs), use lightweight parse
+                    if not self.result.native_stack:
+                        try:
+                            self._parse_large_dump_structure_light(dump_path)
+                            if self.result.native_stack:
+                                self.result.errors.append("Native stack recovered via fallback lightweight parse (full parse had no stack).")
+                        except Exception as _e:
+                            pass
+                    self._report_progress("structure", 1.0, "Structure analysis complete")
                 except Exception as e:
                     self.result.errors.append(f"Minidump parsing error: {e}")
+                    # Try lightweight parse so we still get native stack
+                    try:
+                        self._parse_large_dump_structure_light(dump_path)
+                    except Exception:
+                        pass
+            elif HAS_MINIDUMP and file_size >= ONE_GB:
+                self._report_progress("structure", 0.0, "Lightweight structure parse (large file)...")
+                try:
+                    self._parse_large_dump_structure_light(dump_path)
+                    self.result.errors.append(
+                        f"Large dump ({file_size_gb:.1f}GB): native stack recovered via lightweight structure parse; Lua/JS stacks from memory scan."
+                    )
+                    self._report_progress("structure", 1.0, "Structure parse complete (native stack recovered)")
+                except Exception as e:
+                    self.result.errors.append(
+                        f"Large dump ({file_size_gb:.1f}GB): lightweight structure parse failed ({e}); Lua/JS stacks still from memory scan."
+                    )
+                    self._report_progress("structure", 1.0, "Skipping structure parse (large file)...")
+            else:
+                # No minidump library or parse skipped - use lightweight parse for native stack (works without minidump package)
+                self._report_progress("structure", 0.0, "Lightweight structure parse (native stack)...")
+                try:
+                    self._parse_large_dump_structure_light(dump_path)
+                    if self.result.native_stack:
+                        self._report_progress("structure", 1.0, "Native stack recovered")
+                    else:
+                        self._report_progress("structure", 1.0, "Structure parse complete")
+                except Exception as e:
+                    self.result.errors.append(f"Lightweight structure parse failed: {e}")
+                    self._report_progress("structure", 1.0, "Structure parse skipped")
 
-            # Deep string analysis on raw data
-            self._analyze_raw_memory(raw_data)
+            # #region agent log
+            # Count modules with PDB info for diagnostics
+            modules_with_pdb = [m for m in self.result.module_versions if m.pdb_name and m.pdb_guid]
+            _dlog(
+                "H4",
+                "memory_analyzer.analyze_dump_deep.after_structure",
+                "structure parse summary",
+                {
+                    "native_stack_len": len(self.result.native_stack) if self.result.native_stack else 0,
+                    "module_map_len": len(getattr(self, "_module_map", {}) or {}),
+                    "module_versions_count": len(self.result.module_versions),
+                    "modules_with_pdb_count": len(modules_with_pdb),
+                    "modules_with_pdb_sample": [(m.name[:30], m.pdb_name, m.pdb_guid[:16] if m.pdb_guid else "") for m in modules_with_pdb[:5]],
+                    "exception_code": self.result.exception_code,
+                    "exception_module": self.result.exception_module,
+                },
+            )
+            # Log first few modules WITHOUT pdb info to see what's missing
+            modules_no_pdb = [m for m in self.result.module_versions if not m.pdb_name or not m.pdb_guid]
+            if modules_no_pdb:
+                _dlog(
+                    "H2",
+                    "memory_analyzer.analyze_dump_deep.modules_no_pdb",
+                    "modules without PDB info",
+                    {
+                        "count": len(modules_no_pdb),
+                        "sample": [(m.name[:40], m.pdb_name or "(no pdb_name)", m.pdb_guid[:16] if m.pdb_guid else "(no guid)") for m in modules_no_pdb[:10]],
+                    },
+                )
+            # #endregion
 
-            # Extract Lua stack traces from memory
-            self._extract_lua_stacks(raw_data)
+            # Choose analysis strategy based on file size
+            analysis_mode = "in_memory"
+            if file_size <= self.MAX_FULL_ANALYSIS_SIZE:
+                # Small dump - load entirely into memory
+                self._report_progress("memory", 0.0, f"Loading {file_size_mb}MB dump into memory...")
+                self._analyze_dump_in_memory(dump_path, file_size)
+            elif file_size <= 2 * 1024 * 1024 * 1024:  # 2GB
+                # Medium dump - use streaming analysis
+                analysis_mode = "streaming"
+                self.result.errors.append(
+                    f"Large dump ({file_size_mb}MB) - using streaming analysis"
+                )
+                self._report_progress("streaming", 0.0, f"Starting streaming analysis of {file_size_mb}MB dump...")
+                self._analyze_dump_streaming(dump_path, file_size)
+            else:
+                # Very large dump (2GB+) - use memory-mapped sampling
+                analysis_mode = "sampled"
+                self.result.errors.append(
+                    f"Very large dump ({file_size_gb:.1f}GB) - using sampled analysis"
+                )
+                self._report_progress("sampling", 0.0, f"Starting sampled analysis of {file_size_gb:.1f}GB dump...")
+                self._analyze_dump_sampled(dump_path, file_size)
 
-            # Find and parse full Lua tracebacks
-            self._extract_lua_tracebacks(raw_data)
+            # #region agent log
+            raw_strings = self.result.raw_strings or []
+            resource_path_strings = 0
+            lua_hint_strings = 0
+            js_hint_strings = 0
+            for s in raw_strings:
+                sl = (s or "").lower()
+                if "resources/" in sl or "resources\\" in sl:
+                    resource_path_strings += 1
+                if ".lua" in sl:
+                    lua_hint_strings += 1
+                if ".js" in sl:
+                    js_hint_strings += 1
+            _dlog(
+                "H1",
+                "memory_analyzer.analyze_dump_deep.post_scan",
+                "post memory scan summary",
+                {
+                    "analysis_mode": analysis_mode,
+                    "raw_strings_count": len(raw_strings),
+                    "all_evidence_count": len(self.result.all_evidence),
+                    "resources_count": len(self.result.resources),
+                    "resource_names_sample": list(self.result.resources.keys())[:10],
+                    "lua_stacks_count": len(self.result.lua_stacks),
+                    "js_stacks_count": len(self.result.js_stacks),
+                    "script_paths_count": len(self.result.script_paths),
+                    "resource_path_strings": resource_path_strings,
+                    "lua_hint_strings": lua_hint_strings,
+                    "js_hint_strings": js_hint_strings,
+                    "errors_count": len(self.result.errors),
+                },
+            )
+            # #endregion
 
-            # Find Lua runtime errors with context
-            self._find_lua_runtime_errors(raw_data)
+            # Populate module_names from parsed minidump (avoids re-reading for full_analysis)
+            for _base, (_end, name) in self._module_map.items():
+                if name and name not in self.result.module_names:
+                    self.result.module_names.append(name)
+            # Also add module-like strings from raw_strings (e.g. from heap)
+            for s in self.result.raw_strings:
+                lower = s.lower()
+                if ('.dll' in lower or '.exe' in lower) and s not in self.result.module_names:
+                    if len(s) < 260 and re.match(r'^[\w.\-\\]+$', s):
+                        self.result.module_names.append(s)
 
-            # Extract JS stack traces from memory
-            self._extract_js_stacks(raw_data)
+            # Add evidence from open file handles (resource paths at crash time)
+            self._add_evidence_from_handles()
 
-            # Find script errors in memory
-            self._find_script_errors(raw_data)
-
-            # Find CitizenFX runtime contexts
-            self._find_citizenfx_contexts(raw_data)
-
-            # Analyze for FiveM-specific patterns
-            self._find_fivem_patterns(raw_data)
+            # Scan comment and assertion streams for resource names
+            self._add_evidence_from_comment_and_assertion_streams()
 
             # Correlate evidence and determine primary suspects
+            self._report_progress("correlate", 0.0, "Correlating evidence...")
             self._correlate_evidence()
+            self._report_progress("correlate", 1.0, f"Found {len(self.result.primary_suspects)} suspects")
+
+            # Break down stack traces into resources involved per stack
+            self._compute_stack_resources()
+
+            # #region agent log
+            _dlog(
+                "H1",
+                "memory_analyzer.analyze_dump_deep.post_correlate",
+                "suspect summary",
+                {
+                    "primary_suspects_count": len(self.result.primary_suspects),
+                    "primary_suspects_top3": [s.name for s in (self.result.primary_suspects or [])[:3]],
+                    "primary_suspect_confidence": getattr(self.result, "primary_suspect_confidence", ""),
+                    "primary_suspect_secondary": getattr(self.result, "primary_suspect_secondary", None),
+                    "resources_count": len(self.result.resources),
+                    "lua_stack_resources_first": (self.result.lua_stack_resources[0] if self.result.lua_stack_resources else []),
+                    "js_stack_resources_first": (self.result.js_stack_resources[0] if self.result.js_stack_resources else []),
+                },
+            )
+            # #endregion
+
+            # #region agent log
+            try:
+                top_details: List[Dict[str, Any]] = []
+                for s in (self.result.primary_suspects or [])[:5]:
+                    info = self.result.resources.get(s.name) if self.result.resources else None
+                    if not info:
+                        continue
+                    top_details.append(
+                        {
+                            "name": info.name,
+                            "evidence_count": getattr(info, "evidence_count", 0),
+                            "evidence_types": sorted([et.name for et in (getattr(info, "evidence_types", set()) or set())]),
+                            "scripts_sample": list(getattr(info, "scripts", [])[:3]),
+                            "likely_script": getattr(info, "likely_script", None),
+                            "path_sample": getattr(info, "path", None),
+                            "all_paths_sample": list(getattr(info, "all_paths", [])[:3]),
+                            "context_details_sample": list(getattr(info, "context_details", [])[:3]),
+                        }
+                    )
+                _dlog(
+                    "H6",
+                    "memory_analyzer.analyze_dump_deep.suspect_details",
+                    "top suspect evidence details",
+                    {"top": top_details},
+                )
+            except Exception:
+                pass
+            # #endregion
 
             self.result.analysis_complete = True
+            # If no stack traces recovered, add diagnostic so user knows if dump lacks stack vs analysis error
+            if not self.result.native_stack and not self.result.lua_stacks and not self.result.js_stacks:
+                diag = self._diagnose_stack_recovery(dump_path)
+                self.result.errors.append(f"Stack recovery diagnostic: {diag}")
 
+            self._report_progress("complete", 1.0, "Analysis complete!")
+
+        except MemoryError:
+            self.result.errors.append(
+                f"Out of memory analyzing dump. File size: {file_size // (1024*1024)}MB. "
+                "Try closing other applications or use a machine with more RAM."
+            )
         except Exception as e:
             import traceback
             self.result.errors.append(f"Analysis failed: {e}")
             self.result.errors.append(f"Traceback: {traceback.format_exc()}")
 
         return self.result
+
+    def _merge_chunk_result(self, chunk_result: "DeepAnalysisResult") -> None:
+        """Merge results from a parallel chunk worker into this analyzer's result."""
+        max_raw = getattr(self, '_max_raw_strings', 3000)
+        seen_raw: Set[str] = set(self.result.raw_strings)
+        max_ev = getattr(self, '_max_evidence', self.MAX_EVIDENCE_ITEMS)
+        for e in chunk_result.all_evidence:
+            if len(self.result.all_evidence) >= max_ev:
+                break
+            self._add_evidence(e)
+        for s in chunk_result.raw_strings:
+            if len(self.result.raw_strings) >= max_raw:
+                break
+            if s not in seen_raw:
+                seen_raw.add(s)
+                self.result.raw_strings.append(s)
+        self.result.script_errors.extend(chunk_result.script_errors)
+        self.result.lua_stacks.extend(chunk_result.lua_stacks)
+        self.result.js_stacks.extend(chunk_result.js_stacks)
+        self.result.script_paths.extend(chunk_result.script_paths)
+        self.result.native_calls.extend(chunk_result.native_calls)
+        self.result.event_handlers.extend(chunk_result.event_handlers)
+        self.result.entity_creations.extend(chunk_result.entity_creations)
+        self.result.entity_deletions.extend(chunk_result.entity_deletions)
+        self.result.timers_created.extend(chunk_result.timers_created)
+        self.result.event_handlers_registered.extend(chunk_result.event_handlers_registered)
+        self.result.event_handlers_removed.extend(chunk_result.event_handlers_removed)
+        self.result.memory_allocations.extend(chunk_result.memory_allocations)
+        self.result.memory_frees.extend(chunk_result.memory_frees)
+        self.result.memory_leak_indicators.extend(chunk_result.memory_leak_indicators)
+        self.result.pool_exhaustion_indicators.extend(chunk_result.pool_exhaustion_indicators)
+        self.result.database_patterns.extend(chunk_result.database_patterns)
+        self.result.nui_patterns.extend(chunk_result.nui_patterns)
+        self.result.network_patterns.extend(chunk_result.network_patterns)
+        self.result.statebag_patterns.extend(chunk_result.statebag_patterns)
+        if chunk_result.memory_regions:
+            self.result.memory_regions.extend(chunk_result.memory_regions)
+
+    def _analyze_dump_in_memory(self, dump_path: str, file_size: int) -> None:
+        """Analyze a small dump by loading it entirely into memory.
+        
+        When USE_PARALLEL_CHUNKS and dump size >= MIN_SIZE_PARALLEL_IN_MEMORY,
+        splits the buffer into chunks and processes them in parallel (CPU cores).
+        """
+        self._report_progress("memory", 0.2, "Reading dump file...")
+        with open(dump_path, 'rb') as f:
+            raw_data = f.read()
+
+        n_workers = self.MAX_PARALLEL_WORKERS if self.USE_PARALLEL_CHUNKS else 1
+        use_parallel = (
+            self.USE_PARALLEL_CHUNKS
+            and n_workers >= 2
+            and len(raw_data) >= self.MIN_SIZE_PARALLEL_IN_MEMORY
+        )
+
+        if use_parallel:
+            self._report_progress("memory", 0.35, f"Analyzing memory with {n_workers} workers...")
+            overlap = 4096
+            step = (len(raw_data) + n_workers - 1) // n_workers
+            chunks: List[Tuple[bytes, int]] = []
+            for i in range(n_workers):
+                start = i * step
+                if start >= len(raw_data):
+                    break
+                end = min(start + step + overlap, len(raw_data))
+                chunks.append((bytes(raw_data[start:end]), start))
+            if not chunks:
+                self._run_analysis_passes(raw_data)
+            else:
+                with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+                    futures = [executor.submit(_process_chunk_worker, c) for c in chunks]
+                    for future in as_completed(futures):
+                        try:
+                            self._merge_chunk_result(future.result())
+                        except Exception as e:
+                            self.result.errors.append(f"Parallel chunk error: {e}")
+            self._report_progress("memory", 1.0, "Memory analysis complete")
+        else:
+            self._report_progress("memory", 0.4, "Analyzing memory contents...")
+            self._run_analysis_passes(raw_data)
+            self._report_progress("memory", 1.0, "Memory analysis complete")
+
+    def _analyze_dump_streaming(self, dump_path: str, file_size: int) -> None:
+        """Analyze a large dump using streaming/chunked processing.
+        
+        Reads the file in chunks to avoid loading the entire dump into memory.
+        Uses overlapping chunks to catch patterns that span chunk boundaries.
+        """
+        import mmap
+        
+        overlap_size = 4096  # 4KB overlap to catch boundary-spanning patterns
+        chunk_size = self.STREAM_CHUNK_SIZE
+        n_workers = self.MAX_PARALLEL_WORKERS if self.USE_PARALLEL_CHUNKS else 1
+        use_parallel = self.USE_PARALLEL_CHUNKS and n_workers >= 2
+        
+        with open(dump_path, 'rb') as f:
+            try:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    offset = 0
+                    chunk_num = 0
+                    total_chunks = (file_size + chunk_size - 1) // chunk_size
+                    
+                    min_chunks_before_stop = getattr(self, 'MIN_STREAMING_CHUNKS_BEFORE_EARLY_STOP', 16)
+                    max_ev = getattr(self, '_max_evidence', self.MAX_EVIDENCE_ITEMS)
+                    if use_parallel:
+                        # Process chunks in parallel batches using CPU cores
+                        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                            while offset < file_size:
+                                if self._should_abort():
+                                    self._report_progress("streaming", 1.0, "Analysis cancelled")
+                                    break
+                                # Always process at least first 1GB before allowing early stop (full resource extraction)
+                                if chunk_num >= min_chunks_before_stop and len(self.result.all_evidence) >= max_ev:
+                                    self._report_progress("streaming", 1.0, f"Reached maximum evidence ({max_ev} items)")
+                                    break
+                                batch: List[Tuple[bytes, int]] = []
+                                while len(batch) < n_workers and offset < file_size:
+                                    chunk_mb_so_far = offset // (1024 * 1024)
+                                    self._report_progress(
+                                        "streaming", offset / file_size,
+                                        f"Loading chunk {chunk_num + 1}/{total_chunks} ({chunk_mb_so_far}MB)..."
+                                    )
+                                    end = min(offset + chunk_size + overlap_size, file_size)
+                                    batch.append((bytes(mm[offset:end]), offset))
+                                    offset += chunk_size
+                                    chunk_num += 1
+                                if not batch:
+                                    break
+                                futures = {executor.submit(_process_chunk_worker, item): item[1] for item in batch}
+                                for future in as_completed(futures):
+                                    if self._should_abort():
+                                        break
+                                    if chunk_num >= min_chunks_before_stop and len(self.result.all_evidence) >= max_ev:
+                                        break
+                                    try:
+                                        chunk_result = future.result()
+                                        self._merge_chunk_result(chunk_result)
+                                    except Exception as e:
+                                        self.result.errors.append(f"Parallel chunk error: {e}")
+                                progress = offset / file_size
+                                chunk_mb = offset // (1024 * 1024)
+                                total_mb = file_size // (1024 * 1024)
+                                self._report_progress(
+                                    "streaming", progress,
+                                    f"Processed {chunk_num}/{total_chunks} chunks ({chunk_mb}MB/{total_mb}MB) - {len(self.result.all_evidence)} evidence"
+                                )
+                        self._report_progress("streaming", 1.0, f"Streaming analysis complete - {chunk_num} chunks processed (parallel)")
+                    else:
+                        # Sequential chunk processing
+                        min_chunks_before_stop = getattr(self, 'MIN_STREAMING_CHUNKS_BEFORE_EARLY_STOP', 16)
+                        max_ev = getattr(self, '_max_evidence', self.MAX_EVIDENCE_ITEMS)
+                        while offset < file_size:
+                            if self._should_abort():
+                                self._report_progress("streaming", 1.0, "Analysis cancelled")
+                                break
+                            if chunk_num >= min_chunks_before_stop and len(self.result.all_evidence) >= max_ev:
+                                self._report_progress("streaming", 1.0, f"Reached maximum evidence ({max_ev} items)")
+                                break
+                            end = min(offset + chunk_size + overlap_size, file_size)
+                            chunk = mm[offset:end]
+                            progress = offset / file_size
+                            chunk_mb = offset // (1024 * 1024)
+                            total_mb = file_size // (1024 * 1024)
+                            self._report_progress(
+                                "streaming", progress,
+                                f"Processing chunk {chunk_num + 1}/{total_chunks} ({chunk_mb}MB/{total_mb}MB) - {len(self.result.all_evidence)} evidence items found"
+                            )
+                            self._run_analysis_passes(bytes(chunk), chunk_offset=offset)
+                            offset += chunk_size
+                            chunk_num += 1
+                            del chunk
+                        self._report_progress("streaming", 1.0, f"Streaming analysis complete - {chunk_num} chunks processed")
+                        
+            except (mmap.error, OSError) as e:
+                # Fallback to regular chunked reading if mmap fails
+                self.result.errors.append(f"Memory-mapped access failed, using chunked reading: {e}")
+                self._analyze_dump_chunked_fallback(f, file_size, chunk_size, overlap_size)
+
+    def _analyze_dump_chunked_fallback(self, f, file_size: int, chunk_size: int, overlap_size: int) -> None:
+        """Fallback chunked analysis without memory mapping."""
+        f.seek(0)
+        offset = 0
+        prev_overlap = b''
+        chunk_num = 0
+        total_chunks = (file_size + chunk_size - 1) // chunk_size
+        min_chunks_before_stop = getattr(self, 'MIN_STREAMING_CHUNKS_BEFORE_EARLY_STOP', 16)
+        max_ev = getattr(self, '_max_evidence', self.MAX_EVIDENCE_ITEMS)
+        
+        while offset < file_size:
+            if self._should_abort():
+                self._report_progress("streaming", 1.0, "Analysis cancelled")
+                break
+            if chunk_num >= min_chunks_before_stop and len(self.result.all_evidence) >= max_ev:
+                self._report_progress("streaming", 1.0, f"Reached maximum evidence ({max_ev} items)")
+                break
+            
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            
+            # Prepend overlap from previous chunk
+            if prev_overlap:
+                chunk = prev_overlap + chunk
+            
+            # Report progress
+            progress = offset / file_size
+            self._report_progress(
+                "streaming", 
+                progress, 
+                f"Processing chunk {chunk_num + 1}/{total_chunks} - {len(self.result.all_evidence)} evidence items"
+            )
+            
+            self._run_analysis_passes(chunk, chunk_offset=max(0, offset - len(prev_overlap)))
+            
+            # Save overlap for next iteration
+            prev_overlap = chunk[-overlap_size:] if len(chunk) > overlap_size else chunk
+            offset += chunk_size
+            chunk_num += 1
+            
+            # Free memory
+            del chunk
+        
+        self._report_progress("streaming", 1.0, "Chunked analysis complete")
+
+    def _analyze_dump_sampled(self, dump_path: str, file_size: int) -> None:
+        """Analyze a very large dump (2GB+) using strategic sampling.
+        
+        For massive dumps, we sample key regions more aggressively:
+        1. First 200MB - Headers, module info, initial memory state
+        2. Multiple 100MB samples throughout the file (more samples for larger files)
+        3. Last 200MB - Recent allocations, stack data, crash context
+        """
+        import mmap
+        
+        # Increase sample sizes for better coverage
+        sample_size = 100 * 1024 * 1024  # 100MB samples (was 50MB)
+        first_region = 200 * 1024 * 1024  # First 200MB (was 100MB)
+        last_region = 200 * 1024 * 1024   # Last 200MB (was 100MB)
+        file_size_gb = file_size / (1024 * 1024 * 1024)
+        
+        # Calculate sample points (evenly distributed through middle)
+        middle_start = first_region
+        middle_end = file_size - last_region
+        middle_size = middle_end - middle_start
+        
+        # Take MORE samples from the middle - scale with file size
+        # For 6GB file: ~8-10 samples. For 10GB: ~12-15 samples
+        num_middle_samples = min(15, max(5, int(file_size_gb * 2)))
+        total_steps = 2 + num_middle_samples  # first + middle samples + last
+        current_step = 0
+        
+        self._report_progress(
+            "sampling", 
+            0.0, 
+            f"Starting sampled analysis: {file_size_gb:.1f}GB dump, {num_middle_samples + 2} regions to scan"
+        )
+        
+        with open(dump_path, 'rb') as f:
+            try:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    if self._should_abort():
+                        self._report_progress("sampling", 1.0, "Analysis cancelled")
+                        return
+                    # 1. Analyze first region in sub-chunks (50MB each) so UI gets updates and stays responsive
+                    sub_chunk_mb = 50 * 1024 * 1024  # 50MB
+                    num_first_sub = (first_region + sub_chunk_mb - 1) // sub_chunk_mb
+                    for fi in range(num_first_sub):
+                        if self._should_abort():
+                            self._report_progress("sampling", 1.0, "Analysis cancelled")
+                            return
+                        start_off = fi * sub_chunk_mb
+                        end_off = min(start_off + sub_chunk_mb, first_region)
+                        self._report_progress(
+                            "sampling",
+                            current_step / total_steps,
+                            f"Analyzing first region {fi + 1}/{num_first_sub} ({start_off // (1024*1024)}–{end_off // (1024*1024)}MB of {file_size_gb:.1f}GB)..."
+                        )
+                        first_chunk = bytes(mm[start_off:end_off])
+                        self._run_analysis_passes(first_chunk, chunk_offset=start_off)
+                        del first_chunk
+                    current_step += 1
+                    
+                    # DON'T early terminate on first chunk - we want more data
+                    
+                    # 2. Sample middle regions - DO NOT skip even if we have evidence
+                    if middle_size > 0:
+                        sample_interval = middle_size // (num_middle_samples + 1)
+                        for i in range(num_middle_samples):
+                            if self._should_abort():
+                                self._report_progress("sampling", 1.0, "Analysis cancelled")
+                                return
+                            sample_offset = middle_start + (i + 1) * sample_interval
+                            sample_end = min(sample_offset + sample_size, middle_end)
+                            sample_offset_gb = sample_offset / (1024 * 1024 * 1024)
+                            
+                            self._report_progress(
+                                "sampling", 
+                                current_step / total_steps, 
+                                f"Sampling region {i + 1}/{num_middle_samples} at {sample_offset_gb:.1f}GB - {len(self.result.all_evidence)} evidence items"
+                            )
+                            
+                            middle_chunk = bytes(mm[sample_offset:sample_end])
+                            self._run_analysis_passes(middle_chunk, chunk_offset=sample_offset)
+                            del middle_chunk
+                            current_step += 1
+                            
+                            # Only stop early if we have LOTS of evidence (not just "sufficient")
+                            max_ev = getattr(self, '_max_evidence', self.MAX_EVIDENCE_ITEMS)
+                            if len(self.result.all_evidence) >= max_ev:
+                                self._report_progress("sampling", 1.0, f"Collected maximum evidence ({max_ev} items)")
+                                return
+                    
+                    # 3. Analyze last region in sub-chunks (50MB each) so UI stays responsive
+                    if self._should_abort():
+                        self._report_progress("sampling", 1.0, "Analysis cancelled")
+                        return
+                    num_last_sub = (last_region + sub_chunk_mb - 1) // sub_chunk_mb
+                    last_start = file_size - last_region
+                    for li in range(num_last_sub):
+                        if self._should_abort():
+                            self._report_progress("sampling", 1.0, "Analysis cancelled")
+                            return
+                        start_off = last_start + li * sub_chunk_mb
+                        end_off = min(start_off + sub_chunk_mb, file_size)
+                        self._report_progress(
+                            "sampling",
+                            current_step / total_steps,
+                            f"Analyzing last region {li + 1}/{num_last_sub} ({start_off // (1024*1024)}–{end_off // (1024*1024)}MB)..."
+                        )
+                        last_chunk = bytes(mm[start_off:end_off])
+                        self._run_analysis_passes(last_chunk, chunk_offset=start_off)
+                        del last_chunk
+                    current_step += 1
+                    
+                    self._report_progress("sampling", 1.0, f"Sampled analysis complete - {len(self.result.all_evidence)} evidence items found")
+                    
+            except (mmap.error, OSError) as e:
+                self.result.errors.append(f"Memory-mapped sampling failed: {e}")
+                # Fallback: just read first and last 100MB
+                self._analyze_dump_simple_sample(f, file_size)
+
+    def _analyze_dump_simple_sample(self, f, file_size: int) -> None:
+        """Simple sampling fallback - just read first and last portions."""
+        sample_size = 100 * 1024 * 1024  # 100MB
+        
+        self._report_progress("sampling", 0.0, "Fallback: Reading first 100MB...")
+        
+        # Read first 100MB
+        f.seek(0)
+        first_chunk = f.read(sample_size)
+        self._run_analysis_passes(first_chunk, chunk_offset=0)
+        del first_chunk
+        
+        if self._has_sufficient_evidence():
+            self._report_progress("sampling", 1.0, "Found sufficient evidence!")
+            return
+        
+        self._report_progress("sampling", 0.5, "Reading last 100MB...")
+        
+        # Read last 100MB
+        f.seek(max(0, file_size - sample_size))
+        last_chunk = f.read(sample_size)
+        self._run_analysis_passes(last_chunk, chunk_offset=max(0, file_size - sample_size))
+        del last_chunk
+
+    def _run_analysis_passes(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Run all analysis passes on a chunk of data.
+        
+        For large file analysis, we run ALL passes to extract maximum data.
+        """
+        # Deep string analysis on raw data - ALWAYS run
+        self._analyze_raw_memory(data)
+
+        # Extract Lua stack traces from memory - ALWAYS run
+        self._extract_lua_stacks(data)
+
+        # Find and parse full Lua tracebacks - ALWAYS run
+        self._extract_lua_tracebacks(data)
+
+        # Find Lua runtime errors with context - ALWAYS run (high value)
+        self._find_lua_runtime_errors(data)
+
+        # Extract JS stack traces from memory - ALWAYS run
+        self._extract_js_stacks(data)
+
+        # Find script errors in memory - ALWAYS run
+        self._find_script_errors(data)
+
+        # Find CitizenFX runtime contexts - ALWAYS run
+        self._find_citizenfx_contexts(data)
+
+        # Analyze for FiveM-specific patterns - ALWAYS run
+        self._find_fivem_patterns(data)
+
+        # Dedicated pass: extract all FiveM resource names (server.cfg, paths, refs)
+        self._extract_fivem_resource_names_pass(data)
+        
+        # ===== NEW: Memory leak analysis passes =====
+        # Analyze entity creation/deletion patterns
+        self._analyze_entity_lifecycle(data, chunk_offset)
+        
+        # Analyze timer patterns
+        self._analyze_timer_patterns(data, chunk_offset)
+        
+        # Analyze event handler registration/removal
+        self._analyze_event_handlers(data, chunk_offset)
+        
+        # Analyze memory allocation patterns
+        self._analyze_memory_allocations(data, chunk_offset)
+        
+        # Find memory leak indicators
+        self._find_memory_leak_indicators(data, chunk_offset)
+        
+        # Find pool exhaustion indicators
+        self._find_pool_exhaustion(data, chunk_offset)
+        
+        # Find database patterns
+        self._find_database_patterns(data, chunk_offset)
+        
+        # Find NUI/CEF patterns
+        self._find_nui_patterns(data, chunk_offset)
+        
+        # Find network sync patterns
+        self._find_network_patterns(data, chunk_offset)
+        
+        # Find FiveM-specific crash causes
+        self._find_fivem_crash_causes(data, chunk_offset)
+
+    def _has_sufficient_evidence(self) -> bool:
+        """Check if we have enough evidence to make a determination.
+        
+        This is now ONLY used for streaming analysis of medium dumps (500MB-2GB).
+        For sampled analysis of large dumps (2GB+), we always scan all regions.
+        
+        Returns True if we should skip further analysis.
+        """
+        # Only stop if we have a LOT of high-confidence evidence
+        high_confidence_count = sum(
+            1 for e in self.result.all_evidence 
+            if e.confidence >= 0.95  # Increased threshold
+        )
+        
+        # Need 15+ high-confidence items to stop early (was 5)
+        if high_confidence_count >= 15:
+            return True
+        
+        # Need 10+ clear script errors to stop early (was 3)
+        if len(self.result.script_errors) >= 10:
+            return True
+        
+        # If evidence exceeds max, stop collecting
+        if len(self.result.all_evidence) >= self.MAX_EVIDENCE_ITEMS:
+            return True
+        
+        return False
 
     def _analyze_minidump_structure(self, md) -> None:
         """Analyze minidump structure using the minidump library."""
@@ -889,6 +1952,16 @@ class MemoryAnalyzer:
         # Extract all printable strings
         strings = self._extract_strings_advanced(data)
 
+        # Populate raw_strings for pattern matching in full_analysis (avoids re-reading dump)
+        max_raw_strings = getattr(self, '_max_raw_strings', 3000)
+        seen_raw: Set[str] = set()
+        for s, _ in strings:
+            if s not in seen_raw and len(self.result.raw_strings) < max_raw_strings:
+                seen_raw.add(s)
+                self.result.raw_strings.append(s)
+            if len(self.result.raw_strings) >= max_raw_strings:
+                break
+
         # Categorize strings
         for s, offset in strings:
             lower = s.lower()
@@ -947,12 +2020,20 @@ class MemoryAnalyzer:
                     ))
 
     def _extract_strings_advanced(self, data: bytes, min_length: int = 4) -> List[Tuple[str, int]]:
-        """Extract strings with their memory offsets."""
+        """Extract strings with their memory offsets.
+        
+        Optimized with memoryview to avoid copying data and chunked processing
+        for large dumps.
+        """
         results = []
+        data_view = memoryview(data)
+        data_len = len(data)
         current_chars = []
         start_offset = 0
 
-        for i, b in enumerate(data):
+        # Process ASCII strings - use direct byte comparison for speed
+        for i in range(data_len):
+            b = data_view[i]
             if 32 <= b <= 126:
                 if not current_chars:
                     start_offset = i
@@ -965,22 +2046,25 @@ class MemoryAnalyzer:
         if len(current_chars) >= min_length:
             results.append((''.join(current_chars), start_offset))
 
-        # Also try UTF-16 strings (common in Windows)
-        try:
-            i = 0
-            while i < len(data) - 2:
-                if data[i] >= 32 and data[i] <= 126 and data[i+1] == 0:
-                    start = i
-                    chars = []
-                    while i < len(data) - 1 and data[i] >= 32 and data[i] <= 126 and data[i+1] == 0:
-                        chars.append(chr(data[i]))
-                        i += 2
-                    if len(chars) >= min_length:
-                        results.append((''.join(chars), start))
-                else:
-                    i += 1
-        except Exception:
-            pass
+        # UTF-16 strings (common in Windows) - only process if dump is reasonable size
+        # Skip UTF-16 extraction for very large dumps (> 100MB) to save time
+        if data_len < 100 * 1024 * 1024:
+            try:
+                i = 0
+                while i < data_len - 2:
+                    b = data_view[i]
+                    if 32 <= b <= 126 and data_view[i + 1] == 0:
+                        start = i
+                        chars = []
+                        while i < data_len - 1 and 32 <= data_view[i] <= 126 and data_view[i + 1] == 0:
+                            chars.append(chr(data_view[i]))
+                            i += 2
+                        if len(chars) >= min_length:
+                            results.append((''.join(chars), start))
+                    else:
+                        i += 1
+            except Exception:
+                pass
 
         return results
 
@@ -1373,16 +2457,360 @@ class MemoryAnalyzer:
                     memory_address=match.start()
                 ))
 
+    def _extract_fivem_resource_names_pass(self, data: bytes) -> None:
+        """Dedicated pass to extract FiveM resource names from server config, paths, and API context.
+
+        Ensures resources mentioned in server.cfg (ensure/start), server paths (resources/name),
+        resource references, and GetCurrentResourceName context are all tracked so reports
+        show every resource that could be involved in the crash.
+        """
+        # ensure/start resource_name (server.cfg style)
+        for match in self.FIVEM_PATTERNS['ensure_start'].finditer(data):
+            resource = match.group(1).decode('utf-8', errors='replace')
+            if self._is_valid_resource_name(resource):
+                self._add_evidence(ScriptEvidence(
+                    evidence_type=EvidenceType.RESOURCE_NAME,
+                    script_name='server.cfg',
+                    resource_name=resource,
+                    context="Resource in server config (ensure/start)",
+                    confidence=0.6,
+                    memory_address=match.start()
+                ))
+
+        # resources/resname or resources\resname (server path)
+        for match in self.FIVEM_PATTERNS['server_resources_path'].finditer(data):
+            resource = match.group(1).decode('utf-8', errors='replace')
+            if self._is_valid_resource_name(resource):
+                self._add_evidence(ScriptEvidence(
+                    evidence_type=EvidenceType.RESOURCE_NAME,
+                    script_name='path',
+                    resource_name=resource,
+                    file_path=f"resources/{resource}",
+                    context="Resource path in memory",
+                    confidence=0.65,
+                    memory_address=match.start()
+                ))
+
+        # resource: "name" or resource: 'name' (resource reference)
+        for match in self.FIVEM_PATTERNS['resource_ref'].finditer(data):
+            resource = match.group(1).decode('utf-8', errors='replace')
+            if self._is_valid_resource_name(resource):
+                self._add_evidence(ScriptEvidence(
+                    evidence_type=EvidenceType.RESOURCE_NAME,
+                    script_name='resource_ref',
+                    resource_name=resource,
+                    context="Resource reference in memory",
+                    confidence=0.55,
+                    memory_address=match.start()
+                ))
+
+        # GetCurrentResourceName() / GetInvokingResource() - look for resource name string in context
+        for match in self.FIVEM_PATTERNS['get_current_resource'].finditer(data):
+            context_start = max(0, match.start() - 80)
+            context_end = min(len(data), match.end() + 120)
+            context = data[context_start:context_end]
+            # Look for a short string that could be the return value (resource name)
+            res_match = re.search(rb'["\']([A-Za-z0-9_\-]{2,64})["\']', context)
+            if res_match:
+                resource = res_match.group(1).decode('utf-8', errors='replace')
+                if self._is_valid_resource_name(resource):
+                    self._add_evidence(ScriptEvidence(
+                        evidence_type=EvidenceType.RESOURCE_NAME,
+                        script_name='GetCurrentResourceName',
+                        resource_name=resource,
+                        context="Resource name near GetCurrentResourceName/GetInvokingResource",
+                        confidence=0.7,
+                        memory_address=match.start()
+                    ))
+
+    # ===== MEMORY LEAK ANALYSIS FUNCTIONS =====
+    
+    def _analyze_entity_lifecycle(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Analyze entity creation and deletion patterns to detect potential leaks."""
+        # Find entity creations
+        for match in self.FIVEM_PATTERNS['entity_creation'].finditer(data):
+            native_name = match.group(1).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.entity_creations.append((native_name, offset))
+            
+            # Look for resource context nearby
+            context_start = max(0, match.start() - 200)
+            context_end = min(len(data), match.end() + 200)
+            context = data[context_start:context_end]
+            
+            # Try to find resource name in context
+            resource_match = re.search(rb'@?([A-Za-z0-9_\-]{2,64})[/\\]', context)
+            if resource_match:
+                resource = resource_match.group(1).decode('utf-8', errors='replace')
+                if self._is_valid_resource_name(resource):
+                    self._add_evidence(ScriptEvidence(
+                        evidence_type=EvidenceType.NATIVE_CALL,
+                        script_name=native_name,
+                        resource_name=resource,
+                        context=f"Entity creation: {native_name} (potential leak if not deleted)",
+                        confidence=0.6,
+                        memory_address=offset
+                    ))
+        
+        # Find entity deletions
+        for match in self.FIVEM_PATTERNS['entity_deletion'].finditer(data):
+            native_name = match.group(1).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.entity_deletions.append((native_name, offset))
+    
+    def _analyze_timer_patterns(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Analyze timer/interval patterns for potential leaks."""
+        for match in self.FIVEM_PATTERNS['timer_creation'].finditer(data):
+            timer_type = match.group(1).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.timers_created.append((timer_type, offset))
+            
+            # Look for resource context
+            context_start = max(0, match.start() - 200)
+            context_end = min(len(data), match.end() + 200)
+            context = data[context_start:context_end]
+            
+            resource_match = re.search(rb'@?([A-Za-z0-9_\-]{2,64})[/\\]', context)
+            if resource_match:
+                resource = resource_match.group(1).decode('utf-8', errors='replace')
+                if self._is_valid_resource_name(resource):
+                    self._add_evidence(ScriptEvidence(
+                        evidence_type=EvidenceType.NATIVE_CALL,
+                        script_name=timer_type,
+                        resource_name=resource,
+                        context=f"Timer: {timer_type} (check for cleanup on resource stop)",
+                        confidence=0.5,
+                        memory_address=offset
+                    ))
+    
+    def _analyze_event_handlers(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Analyze event handler registration and removal patterns."""
+        # Find registrations
+        for match in self.FIVEM_PATTERNS['event_registration'].finditer(data):
+            handler_type = match.group(1).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.event_handlers_registered.append((handler_type, offset))
+        
+        # Find removals
+        for match in self.FIVEM_PATTERNS['event_removal'].finditer(data):
+            handler_type = match.group(1).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.event_handlers_removed.append((handler_type, offset))
+    
+    def _analyze_memory_allocations(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Analyze C/C++ level memory allocation patterns."""
+        # Find allocations
+        for match in self.FIVEM_PATTERNS['memory_alloc'].finditer(data):
+            alloc_type = match.group(1).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.memory_allocations.append((alloc_type, offset))
+        
+        # Find frees
+        for match in self.FIVEM_PATTERNS['memory_free'].finditer(data):
+            free_type = match.group(1).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.memory_frees.append((free_type, offset))
+    
+    def _find_memory_leak_indicators(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Find strings that indicate memory leak issues."""
+        for indicator_bytes, indicator_type in self.MEMORY_LEAK_INDICATORS:
+            pos = 0
+            while True:
+                idx = data.find(indicator_bytes, pos)
+                if idx == -1:
+                    break
+                pos = idx + 1
+                
+                offset = chunk_offset + idx
+                message = indicator_bytes.decode('utf-8', errors='replace')
+                self.result.memory_leak_indicators.append((message, indicator_type, offset))
+                
+                # Extract context for evidence
+                context_start = max(0, idx - 100)
+                context_end = min(len(data), idx + len(indicator_bytes) + 100)
+                context = data[context_start:context_end]
+                
+                # Try to find resource name
+                resource_match = re.search(rb'@?([A-Za-z0-9_\-]{2,64})[/\\]', context)
+                resource = None
+                if resource_match:
+                    resource = resource_match.group(1).decode('utf-8', errors='replace')
+                    if not self._is_valid_resource_name(resource):
+                        resource = None
+                
+                self._add_evidence(ScriptEvidence(
+                    evidence_type=EvidenceType.ERROR_MESSAGE,
+                    script_name=f"memory_{indicator_type}",
+                    resource_name=resource,
+                    context=f"Memory Issue: {message}",
+                    confidence=0.9,
+                    memory_address=offset
+                ))
+    
+    def _find_pool_exhaustion(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Find pool exhaustion indicators."""
+        for match in self.FIVEM_PATTERNS['pool_exhaustion'].finditer(data):
+            pool_msg = match.group(0).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.pool_exhaustion_indicators.append((pool_msg, offset))
+            
+            # High confidence evidence - pool exhaustion is serious
+            self._add_evidence(ScriptEvidence(
+                evidence_type=EvidenceType.ERROR_MESSAGE,
+                script_name="pool_exhaustion",
+                resource_name=None,
+                context=f"Pool Exhaustion: {pool_msg}",
+                confidence=0.95,
+                memory_address=offset
+            ))
+    
+    def _find_database_patterns(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Find database/ORM patterns that might indicate query issues."""
+        for match in self.FIVEM_PATTERNS['database_pattern'].finditer(data):
+            db_pattern = match.group(0).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.database_patterns.append((db_pattern, offset))
+            
+            # Look for resource context
+            context_start = max(0, match.start() - 200)
+            context_end = min(len(data), match.end() + 200)
+            context = data[context_start:context_end]
+            
+            resource_match = re.search(rb'@?([A-Za-z0-9_\-]{2,64})[/\\]', context)
+            if resource_match:
+                resource = resource_match.group(1).decode('utf-8', errors='replace')
+                if self._is_valid_resource_name(resource):
+                    self._add_evidence(ScriptEvidence(
+                        evidence_type=EvidenceType.NATIVE_CALL,
+                        script_name="database",
+                        resource_name=resource,
+                        context=f"Database: {db_pattern[:50]}",
+                        confidence=0.5,
+                        memory_address=offset
+                    ))
+    
+    def _find_nui_patterns(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Find NUI/CEF patterns that might indicate UI-related memory issues."""
+        for match in self.FIVEM_PATTERNS['nui_memory'].finditer(data):
+            nui_pattern = match.group(0).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.nui_patterns.append((nui_pattern, offset))
+            
+            # Look for resource context
+            context_start = max(0, match.start() - 200)
+            context_end = min(len(data), match.end() + 200)
+            context = data[context_start:context_end]
+            
+            resource_match = re.search(rb'@?([A-Za-z0-9_\-]{2,64})[/\\]', context)
+            if resource_match:
+                resource = resource_match.group(1).decode('utf-8', errors='replace')
+                if self._is_valid_resource_name(resource):
+                    self._add_evidence(ScriptEvidence(
+                        evidence_type=EvidenceType.NATIVE_CALL,
+                        script_name="nui",
+                        resource_name=resource,
+                        context=f"NUI/CEF: {nui_pattern}",
+                        confidence=0.5,
+                        memory_address=offset
+                    ))
+    
+    def _find_network_patterns(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Find network synchronization patterns."""
+        for match in self.FIVEM_PATTERNS['network_sync'].finditer(data):
+            net_pattern = match.group(0).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.network_patterns.append((net_pattern, offset))
+            
+            # Look for resource context
+            context_start = max(0, match.start() - 200)
+            context_end = min(len(data), match.end() + 200)
+            context = data[context_start:context_end]
+            
+            resource_match = re.search(rb'@?([A-Za-z0-9_\-]{2,64})[/\\]', context)
+            if resource_match:
+                resource = resource_match.group(1).decode('utf-8', errors='replace')
+                if self._is_valid_resource_name(resource):
+                    self._add_evidence(ScriptEvidence(
+                        evidence_type=EvidenceType.NATIVE_CALL,
+                        script_name="network",
+                        resource_name=resource,
+                        context=f"Network: {net_pattern}",
+                        confidence=0.5,
+                        memory_address=offset
+                    ))
+        
+        # Also check state bag patterns
+        for match in self.FIVEM_PATTERNS['statebag_pattern'].finditer(data):
+            sb_pattern = match.group(0).decode('utf-8', errors='replace')
+            offset = chunk_offset + match.start()
+            self.result.statebag_patterns.append((sb_pattern, offset))
+
+    def _find_fivem_crash_causes(self, data: bytes, chunk_offset: int = 0) -> None:
+        """Find FiveM-specific crash cause patterns."""
+        for marker, cause_type, description in self.FIVEM_CRASH_CAUSES:
+            pos = 0
+            while True:
+                idx = data.find(marker, pos)
+                if idx == -1:
+                    break
+                pos = idx + 1
+                
+                offset = chunk_offset + idx
+                
+                # Extract context around the marker
+                context_start = max(0, idx - 150)
+                context_end = min(len(data), idx + len(marker) + 150)
+                context = data[context_start:context_end]
+                
+                # Try to find resource name in context
+                resource_match = re.search(rb'@?([A-Za-z0-9_\-]{2,64})[/\\]', context)
+                resource = None
+                if resource_match:
+                    resource = resource_match.group(1).decode('utf-8', errors='replace')
+                    if not self._is_valid_resource_name(resource):
+                        resource = None
+                
+                # High confidence evidence for crash causes
+                self._add_evidence(ScriptEvidence(
+                    evidence_type=EvidenceType.ERROR_MESSAGE,
+                    script_name=f"crash_{cause_type}",
+                    resource_name=resource,
+                    context=f"FiveM Crash: {description} ({marker.decode('utf-8', errors='replace')})",
+                    confidence=0.85,
+                    memory_address=offset
+                ))
+
     def _is_valid_resource_name(self, name: str) -> bool:
         """Check if a name is a valid FiveM resource name (not a system path segment)."""
         if not name:
             return False
-        name_lower = name.lower().strip()
+        name_lower = name.lower().strip().strip('@')
         # Must be at least 2 characters
         if len(name_lower) < 2:
             return False
+        # Reject obvious internal/runtime markers that look like "resource names" in memory.
+        # These are not user resources and commonly appear near CitizenFX runtime structures.
+        if name_lower.startswith(("citizen-scripting-", "citizen-resources-", "citizen-server-impl")):
+            return False
+        if name_lower.startswith(("cfx-fivem-", "cfx-fxserver-")):
+            return False
+        # Must be a plain resource folder name (avoid accidentally treating filenames as resources)
+        # FiveM resource names are typically directory names like "oxmysql", "qb-core", "es_extended".
+        # Reject anything that looks like a file (main.lua, webpack.js) or contains path separators.
+        if any(sep in name_lower for sep in ('/', '\\', ':')):
+            return False
+        # Reject common file-like suffixes
+        if '.' in name_lower:
+            # If it has a dot, it is almost certainly a filename rather than a resource directory
+            return False
+        # Enforce allowed characters (avoid false positives like "main.lua", "webpack.js")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,63}", name_lower):
+            return False
         # Check against ignored path segments
         if name_lower in self.IGNORED_PATH_SEGMENTS:
+            return False
+        # Manifest files are metadata, not resources - reject them as resource names
+        if name_lower in self.MANIFEST_FILES:
             return False
         # Must start with alphanumeric
         if not name_lower[0].isalnum():
@@ -1421,8 +2849,10 @@ class MemoryAnalyzer:
     def _extract_resource_from_path(self, file_path: str) -> Optional[str]:
         """Extract a valid FiveM resource name from a file path.
 
-        Scans path segments to find the first valid resource name,
-        skipping common system/internal path segments.
+        Scans path segments to find a valid resource name. Prefers the segment
+        immediately before known subfolders (client, server, shared, html) so
+        paths like esx_menu/client/main.lua yield 'esx_menu' rather than stopping
+        on a later segment.
         """
         if not file_path:
             return None
@@ -1431,12 +2861,50 @@ class MemoryAnalyzer:
         if self._is_internal_fivem_path(file_path):
             return None
 
+        raw = str(file_path).strip()
+        raw_norm = raw.replace('\\', '/')
+        # "Anchored" paths are more reliable resource indicators:
+        # - @resource/... (FiveM source format)
+        # - absolute/absolute-ish paths (/..., \..., C:\..., .../resources/<res>/...)
+        anchored = (
+            raw.startswith('@')
+            or raw.startswith('/')
+            or raw.startswith('\\')
+            or bool(re.match(r'^[A-Za-z]:[\\/]', raw))
+            or ('/resources/' in raw_norm.lower() or '\\resources\\' in raw.lower())
+        )
+
         # Normalize path separators and split
-        normalized = file_path.replace('\\', '/').strip('@')
+        normalized = raw_norm.strip('@')
         parts = [p for p in normalized.split('/') if p]
 
-        # Look for a valid resource name in path segments
-        for part in parts:
+        # Subfolder names that indicate the previous segment is the resource root
+        resource_subfolders = {'client', 'server', 'shared', 'html', 'modules', 'config', 'locales'}
+
+        # If the path starts with a typical resource subfolder (client/server/html/etc) but has no
+        # resource root segment before it, it's likely a truncated/relative path. Don't guess deeper.
+        # Examples seen in dumps: "html/games/..." or "client/editable/..." (missing "<resource>/").
+        if not anchored and parts and parts[0].lower() in resource_subfolders:
+            return None
+
+        # If the path is unanchored AND only looks like "segment/file.lua|file.js",
+        # do NOT guess the first segment is a resource. These shallow relative paths
+        # are frequently false positives (e.g. "locales/en.lua" losing its first char -> "ocales/en.lua").
+        if not anchored and len(parts) == 2:
+            tail = parts[-1].lower()
+            if tail.endswith(('.lua', '.js')):
+                return None
+
+        for i, part in enumerate(parts):
+            part_lower = part.lower()
+            # If this segment is a known resource subfolder, the resource name is the segment before it
+            if part_lower in resource_subfolders and i > 0:
+                candidate = parts[i - 1]
+                if '.' not in candidate or candidate.split('.')[-1].lower() not in (
+                    'lua', 'js', 'dll', 'exe', 'json', 'xml', 'ts', 'css'
+                ):
+                    if self._is_valid_resource_name(candidate):
+                        return candidate
             # Skip file extensions
             if '.' in part and part.split('.')[-1].lower() in ('lua', 'js', 'dll', 'exe', 'json', 'xml'):
                 continue
@@ -1445,8 +2913,63 @@ class MemoryAnalyzer:
 
         return None
 
+    def _get_resources_for_lua_stack(self, stack: List[LuaStackFrame]) -> List[str]:
+        """Extract unique FiveM resource names from a Lua stack (frame sources)."""
+        seen: Set[str] = set()
+        out: List[str] = []
+        for frame in stack:
+            res = self._extract_resource_from_path(frame.source)
+            if res and self._is_valid_resource_name(res) and res not in seen:
+                seen.add(res)
+                out.append(res)
+        return out
+
+    def _get_resources_for_js_stack(self, stack_str: str) -> List[str]:
+        """Extract unique FiveM resource names from a JS stack trace string."""
+        seen: Set[str] = set()
+        out: List[str] = []
+        # Match @resource/path or resource/path in stack lines
+        for match in re.finditer(r'@?([A-Za-z0-9_\-]{2,64})[/\\]', stack_str):
+            name = match.group(1)
+            if self._is_valid_resource_name(name) and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
+
+    def _compute_stack_resources(self) -> None:
+        """Populate lua_stack_resources and js_stack_resources from stack traces."""
+        self.result.lua_stack_resources = [
+            self._get_resources_for_lua_stack(stack) for stack in self.result.lua_stacks
+        ]
+        self.result.js_stack_resources = [
+            self._get_resources_for_js_stack(trace) for trace in self.result.js_stacks
+        ]
+
     def _add_evidence(self, evidence: ScriptEvidence) -> None:
-        """Add evidence and update resource tracking."""
+        """Add evidence and update resource tracking.
+        
+        Includes deduplication to prevent processing the same evidence multiple times.
+        """
+        # Create a deduplication key for this evidence
+        dedup_key = (
+            evidence.evidence_type,
+            evidence.script_name or '',
+            evidence.resource_name or '',
+            evidence.file_path or '',
+            evidence.line_number or 0
+        )
+        
+        # Skip if we've already seen this exact evidence
+        if hasattr(self, '_evidence_seen'):
+            if dedup_key in self._evidence_seen:
+                return
+            self._evidence_seen.add(dedup_key)
+        
+        # Check evidence limit for performance (higher for large files)
+        max_ev = getattr(self, '_max_evidence', self.MAX_EVIDENCE_ITEMS)
+        if len(self.result.all_evidence) >= max_ev:
+            return
+
         # Always add to all_evidence first
         self.result.all_evidence.append(evidence)
 
@@ -1488,12 +3011,25 @@ class MemoryAnalyzer:
 
         # 5. Last resort: use any part of the file path that's a valid resource name
         if not resource_name and evidence.file_path:
-            parts = evidence.file_path.replace('\\', '/').split('/')
-            for part in reversed(parts):
-                if part and not part.endswith(('.lua', '.js', '.dll', '.exe')):
-                    if self._is_valid_resource_name(part):
-                        resource_name = part
-                        break
+            raw = str(evidence.file_path).strip()
+            raw_norm = raw.replace('\\', '/')
+            parts = [p for p in raw_norm.strip('@').split('/') if p]
+            anchored = (
+                raw.startswith('@')
+                or raw.startswith('/')
+                or raw.startswith('\\')
+                or bool(re.match(r'^[A-Za-z]:[\\/]', raw))
+                or ('/resources/' in raw_norm.lower() or '\\resources\\' in raw.lower())
+            )
+            # Avoid false positives from shallow relative paths like "locales/en.lua" (or truncated "ocales/en.lua")
+            # and "ws/news.js" where the first segment is not reliably a resource name.
+            resource_subfolders = {'client', 'server', 'shared', 'html', 'modules', 'config', 'locales'}
+            if anchored and not (parts and parts[0].lower() in resource_subfolders):
+                for part in reversed(parts):
+                    if part and not part.endswith(('.lua', '.js', '.dll', '.exe')):
+                        if self._is_valid_resource_name(part):
+                            resource_name = part
+                            break
 
         # Only proceed if we have a valid resource name
         if not resource_name or not self._is_valid_resource_name(resource_name):
@@ -1517,6 +3053,15 @@ class MemoryAnalyzer:
 
             if evidence.script_name and evidence.script_name not in info.scripts:
                 info.scripts.append(evidence.script_name)
+            # Script-level hint: from ERROR_MESSAGE evidence, surface likely script file for report
+            if (
+                evidence.evidence_type == EvidenceType.ERROR_MESSAGE
+                and evidence.script_name
+                and (evidence.script_name.endswith('.lua') or evidence.script_name.endswith('.js'))
+            ):
+                script_base = os.path.basename(evidence.script_name)
+                if not info.likely_script or script_base == evidence.script_name:
+                    info.likely_script = script_base
 
         if evidence.file_path:
             info.path = evidence.file_path
@@ -1542,6 +3087,7 @@ class MemoryAnalyzer:
             EvidenceType.JS_STACK_TRACE: 9.0,
             EvidenceType.EXCEPTION_ADDRESS: 8.0,
             EvidenceType.SCRIPT_PATH: 5.0,
+            EvidenceType.HANDLE_PATH: 5.0,
             EvidenceType.THREAD_STACK: 6.0,
             EvidenceType.EVENT_HANDLER: 2.0,
             EvidenceType.NATIVE_CALL: 2.0,
@@ -1570,6 +3116,56 @@ class MemoryAnalyzer:
                 scores[resource] = 0.0
             scores[resource] += weight * confidence
 
+        # When fault is in script runtime (scripthandler, citizen-resources-*, etc.), boost resources
+        # that already have high-value evidence so exception_module helps attribution
+        exc_mod = (self.result.exception_module or '').lower()
+        if exc_mod:
+            for sub in self.SCRIPT_RUNTIME_MODULE_SUBSTRINGS:
+                if sub in exc_mod:
+                    exc_weight = weights.get(EvidenceType.EXCEPTION_ADDRESS, 8.0)
+                    exc_confidence = 0.6
+                    for res_name, info in self.result.resources.items():
+                        if scores.get(res_name, 0) <= 0:
+                            continue
+                        has_high = (
+                            EvidenceType.LUA_STACK_TRACE in info.evidence_types
+                            or EvidenceType.JS_STACK_TRACE in info.evidence_types
+                            or EvidenceType.ERROR_MESSAGE in info.evidence_types
+                        )
+                        if has_high:
+                            scores[res_name] = scores.get(res_name, 0) + exc_weight * exc_confidence
+                    break
+
+        # Optional: when native stack shows script runtime in first few frames, boost resources
+        # that already have Lua/JS/error evidence (reinforces "crash in script code")
+        if self.result.native_stack:
+            native_frame_re = re.compile(r'^\s*(.+?)\s*\+\s*0x', re.IGNORECASE)
+            first_frames = self.result.native_stack[:5]
+            for frame in first_frames:
+                m = native_frame_re.match((frame or '').strip())
+                if not m:
+                    continue
+                mod_name = (m.group(1) or '').strip().lower()
+                if not mod_name:
+                    continue
+                for sub in self.SCRIPT_RUNTIME_MODULE_SUBSTRINGS:
+                    if sub in mod_name:
+                        native_boost = 2.0
+                        for res_name, info in self.result.resources.items():
+                            if scores.get(res_name, 0) <= 0:
+                                continue
+                            has_high = (
+                                EvidenceType.LUA_STACK_TRACE in info.evidence_types
+                                or EvidenceType.JS_STACK_TRACE in info.evidence_types
+                                or EvidenceType.ERROR_MESSAGE in info.evidence_types
+                            )
+                            if has_high:
+                                scores[res_name] = scores.get(res_name, 0) + native_boost
+                        break
+                else:
+                    continue
+                break
+
         # Adjust scores for internal scripts
         for resource_name, score in list(scores.items()):
             # Skip if resource wasn't added to resources dict (should not happen now)
@@ -1593,9 +3189,10 @@ class MemoryAnalyzer:
                 self._redistribute_blame_from_internal(resource_name, scores)
 
         # Sort resources by score
+        # Filter out resources with 0 score AND 0 evidence_count (presence-only resources)
         scored_resources = [
             resource for resource in self.result.resources.values()
-            if scores.get(resource.name, 0) > 0
+            if scores.get(resource.name, 0) > 0 and resource.evidence_count > 0
         ]
 
         sorted_resources = sorted(
@@ -1606,6 +3203,38 @@ class MemoryAnalyzer:
 
         # Top suspects are resources with highest scores
         self.result.primary_suspects = sorted_resources[:10]
+
+        # Tie-breaking: when top two have scores within 10-15%, mark secondary for report
+        self.result.primary_suspect_secondary = None
+        if len(sorted_resources) >= 2:
+            s0 = scores.get(sorted_resources[0].name, 0)
+            s1 = scores.get(sorted_resources[1].name, 0)
+            if s0 > 0 and s1 > 0 and (s0 - s1) / s0 < 0.15:
+                self.result.primary_suspect_secondary = sorted_resources[1].name
+
+        # Confidence hint for report wording
+        if self.result.primary_suspect_secondary:
+            self.result.primary_suspect_confidence = "medium"
+        elif sorted_resources:
+            top = self.result.resources.get(sorted_resources[0].name)
+            top_types = set(getattr(top, "evidence_types", set()) or set()) if top else set()
+            if (
+                EvidenceType.ERROR_MESSAGE in top_types
+                and (EvidenceType.LUA_STACK_TRACE in top_types or EvidenceType.JS_STACK_TRACE in top_types)
+            ):
+                self.result.primary_suspect_confidence = "high"
+            elif (
+                EvidenceType.ERROR_MESSAGE in top_types
+                or EvidenceType.LUA_STACK_TRACE in top_types
+                or EvidenceType.JS_STACK_TRACE in top_types
+            ):
+                # Some direct crash-adjacent evidence exists, but not enough to be "high".
+                self.result.primary_suspect_confidence = "medium"
+            else:
+                # Only weak signals (e.g. stray SCRIPT_PATH strings) - avoid overstating certainty.
+                self.result.primary_suspect_confidence = "low"
+        else:
+            self.result.primary_suspect_confidence = "low"
 
     def _redistribute_blame_from_internal(self, internal_resource: str, scores: Dict[str, float]) -> None:
         """Move blame from internal resources to the calling user resource."""
@@ -1667,6 +3296,243 @@ class MemoryAnalyzer:
             if base <= address < end:
                 return (name, base)
         return None
+
+    # Minidump stream type constants (minidumpapiset.h)
+    _THREAD_LIST_STREAM = 3
+    _MODULE_LIST_STREAM = 4
+    _EXCEPTION_STREAM = 6
+
+    def _parse_large_dump_structure_light(self, dump_path: str) -> None:
+        """Lightweight structure-only parse for large dumps (>=1GB). Reads only header,
+        directory, exception/thread/module streams and crashing thread stack - no full parse.
+        Recovers native (C/C++) stack trace and module map; Lua/JS stacks come from memory scan.
+        """
+        with open(dump_path, 'rb') as f:
+            # 1. Header: Signature(4), Version(4), NumberOfStreams(4), StreamDirectoryRva(4), ...
+            header = f.read(32)
+            if len(header) < 32 or header[:4] != b'MDMP':
+                return
+            num_streams = struct.unpack('<I', header[8:12])[0]
+            dir_rva = struct.unpack('<I', header[12:16])[0]
+            # Crash time from header (TimeDateStamp at offset 20)
+            if len(header) >= 24:
+                ts = struct.unpack('<I', header[20:24])[0]
+                if ts:
+                    self.result.crash_time = ts
+
+            # 2. Directory: array of (StreamType, DataSize, Rva) = 12 bytes each
+            f.seek(dir_rva)
+            dir_data = f.read(num_streams * 12)
+            streams = {}
+            for i in range(num_streams):
+                off = i * 12
+                stype = struct.unpack('<I', dir_data[off:off+4])[0]
+                size = struct.unpack('<I', dir_data[off+4:off+8])[0]
+                rva = struct.unpack('<I', dir_data[off+8:off+12])[0]
+                streams[stype] = (size, rva)
+
+            # 3. Exception stream (6): ThreadId at offset 0
+            crash_tid = None
+            if self._EXCEPTION_STREAM in streams:
+                size, rva = streams[self._EXCEPTION_STREAM]
+                f.seek(rva)
+                exc_data = f.read(min(size, 64))
+                if len(exc_data) >= 4:
+                    crash_tid = struct.unpack('<I', exc_data[0:4])[0]
+                if len(exc_data) >= 12:
+                    code = struct.unpack('<I', exc_data[8:12])[0]
+                    self.result.exception_code = code
+                if len(exc_data) >= 32:
+                    exc_addr = struct.unpack('<Q', exc_data[24:32])[0]
+                    self.result.exception_address = exc_addr
+
+            # 4. Module list (4): build _module_map. MINIDUMP_MODULE = 108 bytes: BaseOfImage(8), SizeOfImage(4), ..., ModuleNameRva(4) at 20
+            if self._MODULE_LIST_STREAM in streams:
+                size, rva = streams[self._MODULE_LIST_STREAM]
+                f.seek(rva)
+                mod_count = struct.unpack('<I', f.read(4))[0]
+                MODULE_SIZE = 108
+                for _ in range(min(mod_count, 2000)):  # cap for safety
+                    mod = f.read(MODULE_SIZE)
+                    if len(mod) < 24:
+                        break
+                    base = struct.unpack('<Q', mod[0:8])[0]
+                    img_size = struct.unpack('<I', mod[8:12])[0]
+                    name_rva = struct.unpack('<I', mod[20:24])[0]
+                    name = ""
+                    if name_rva and name_rva < 0x7FFFFFFF:
+                        try:
+                            f.seek(name_rva)
+                            name_len = struct.unpack('<I', f.read(4))[0]  # Length in bytes (UTF-16)
+                            if 0 < name_len < 2048:
+                                name_buf = f.read(name_len)
+                                name = name_buf.decode('utf-16-le', errors='replace').rstrip('\x00')
+                                if '\\' in name:
+                                    name = name.split('\\')[-1]
+                        except Exception:
+                            pass
+                    if base and name:
+                        end = int(base) + int(img_size or 0)
+                        self._module_map[int(base)] = (end, name)
+                        if self.result.exception_address and base <= self.result.exception_address < base + (img_size or 0):
+                            self.result.exception_module = name
+                        # PDB info from CvRecord (MINIDUMP_MODULE: CvRecord at offset 76 = 24 + 52 VS_FIXEDFILEINFO)
+                        pdb_name, pdb_guid, pdb_age = "", "", 0
+                        if len(mod) >= 84:
+                            cv_size = struct.unpack('<I', mod[76:80])[0]
+                            cv_rva = struct.unpack('<I', mod[80:84])[0]
+                            if cv_rva and cv_size and cv_size >= 24:
+                                try:
+                                    f.seek(cv_rva)
+                                    cv_data = f.read(min(cv_size, 512))
+                                    if cv_data[:4] == b'RSDS':
+                                        # GUID 16 bytes, age 4 bytes, then pdb path (null-terminated)
+                                        pdb_guid = cv_data[4:20].hex().upper()
+                                        pdb_age = struct.unpack('<I', cv_data[20:24])[0]
+                                        pdb_name = cv_data[24:].split(b'\x00', 1)[0].decode('utf-8', errors='replace').strip()
+                                        if '/' in pdb_name or '\\' in pdb_name:
+                                            pdb_name = pdb_name.replace('\\', '/').split('/')[-1]
+                                except Exception:
+                                    pass
+                        # #region agent log
+                        if pdb_name or pdb_guid:
+                            _dlog("H2", "memory_analyzer._parse_lightweight.cv_record", "extracted PDB info", {
+                                "module": name[:40],
+                                "pdb_name": pdb_name,
+                                "pdb_guid": pdb_guid[:20] if pdb_guid else "",
+                                "pdb_age": pdb_age,
+                                "cv_size": cv_size,
+                                "cv_rva": cv_rva,
+                            })
+                        # #endregion
+                        self.result.module_versions.append(ModuleVersionInfo(
+                            name=name,
+                            base_address=int(base),
+                            size=int(img_size or 0),
+                            pdb_name=pdb_name,
+                            pdb_guid=pdb_guid,
+                            pdb_age=pdb_age,
+                        ))
+
+            # 5. Thread list (3): find crashing thread stack RVA (or first thread with stack if no exception).
+            # MINIDUMP_THREAD = 48 bytes: ThreadId(4), SuspendCount(4), PriorityClass(4), Priority(4), Teb(8),
+            # Stack at 24 (StartOfMemoryRange 8, DataSize 4, Rva 4), ThreadContext(8)
+            stack_rva = stack_size = None
+            threads_with_stack: list[tuple[int, int, int, int, int, int]] = []
+            if self._THREAD_LIST_STREAM in streams:
+                size, rva = streams[self._THREAD_LIST_STREAM]
+                f.seek(rva)
+                thread_count = struct.unpack('<I', f.read(4))[0]
+                THREAD_SIZE = 48
+                for _ in range(min(thread_count, 4096)):
+                    th = f.read(THREAD_SIZE)
+                    if len(th) < 48:
+                        break
+                    tid = struct.unpack('<I', th[0:4])[0]
+                    priority = struct.unpack('<I', th[12:16])[0]
+                    priority_class = struct.unpack('<I', th[8:12])[0]
+                    teb = struct.unpack('<Q', th[16:24])[0]
+                    stack_start = struct.unpack('<Q', th[24:32])[0]
+                    th_stack_size = struct.unpack('<I', th[32:36])[0]
+                    th_stack_rva = struct.unpack('<I', th[36:40])[0]
+                    # Populate threads_extended for display even when using lightweight parse
+                    ext_info = ThreadExtendedInfo(
+                        thread_id=int(tid),
+                        priority=int(priority),
+                        base_priority=int(priority_class),
+                        teb_address=int(teb) if teb else None,
+                        stack_base=int(stack_start) if stack_start else None,
+                        stack_limit=int(stack_start) + int(th_stack_size) if stack_start and th_stack_size else None,
+                    )
+                    self.result.threads_extended.append(ext_info)
+                    if th_stack_rva and th_stack_size and 0 < th_stack_size < 16 * 1024 * 1024:
+                        threads_with_stack.append((tid, th_stack_rva, th_stack_size, priority, priority_class, teb))
+                # Prefer crashing thread; if no exception stream, use first thread with valid stack
+                if crash_tid is not None:
+                    for tid, sr, ss, *_ in threads_with_stack:
+                        if tid == crash_tid:
+                            stack_rva, stack_size = sr, ss
+                            break
+                if stack_rva is None and threads_with_stack:
+                    stack_rva = threads_with_stack[0][1]
+                    stack_size = threads_with_stack[0][2]
+
+            # 6. Read stack memory and walk for native stack. If primary thread yields no frames, try others.
+            def _walk_stack_to_frames(stack_data: bytes) -> list[str]:
+                frames = []
+                for i in range(0, min(len(stack_data), 64 * 1024), 8):  # cap 64KB of stack
+                    if i + 8 > len(stack_data):
+                        break
+                    ptr_val = struct.unpack('<Q', stack_data[i:i+8])[0]
+                    mod_info = self._get_module_info_for_address(ptr_val)
+                    if mod_info:
+                        name, base = mod_info
+                        offset = ptr_val - base
+                        frames.append(f"{name} + 0x{offset:X}")
+                if frames:
+                    dedup = [frames[0]]
+                    for fr in frames[1:]:
+                        if fr != dedup[-1]:
+                            dedup.append(fr)
+                return dedup
+
+            if stack_rva and stack_size and stack_size > 0 and stack_size < 16 * 1024 * 1024:
+                f.seek(stack_rva)
+                stack_data = f.read(stack_size)
+                if len(stack_data) >= 8:
+                    frames = _walk_stack_to_frames(stack_data)
+                    if frames:
+                        self.result.native_stack = frames
+                    elif threads_with_stack:
+                        # Primary thread had no module-matching frames; try next threads
+                        for tid, sr, ss, *_ in threads_with_stack[1:]:
+                            if (sr, ss) == (stack_rva, stack_size):
+                                continue
+                            f.seek(sr)
+                            other_data = f.read(ss)
+                            if len(other_data) >= 8:
+                                frames = _walk_stack_to_frames(other_data)
+                                if frames:
+                                    self.result.native_stack = frames
+                                    break
+
+    def _diagnose_stack_recovery(self, dump_path: str) -> str:
+        """Quick check: does the dump contain thread list and stack memory? Returns a short diagnostic string."""
+        try:
+            with open(dump_path, 'rb') as f:
+                header = f.read(32)
+                if len(header) < 32 or header[:4] != b'MDMP':
+                    return "Dump is not a valid minidump (bad header)."
+                num_streams = struct.unpack('<I', header[8:12])[0]
+                dir_rva = struct.unpack('<I', header[12:16])[0]
+                f.seek(dir_rva)
+                dir_data = f.read(num_streams * 12)
+                thread_rva = thread_size = None
+                for i in range(num_streams):
+                    off = i * 12
+                    stype = struct.unpack('<I', dir_data[off:off+4])[0]
+                    size = struct.unpack('<I', dir_data[off+4:off+8])[0]
+                    rva = struct.unpack('<I', dir_data[off+8:off+12])[0]
+                    if stype == 3:  # ThreadListStream
+                        thread_rva, thread_size = rva, size
+                        break
+                if thread_rva is None:
+                    return "Dump does not contain a thread list (no stack memory descriptors)."
+                f.seek(thread_rva)
+                th_count = struct.unpack('<I', f.read(4))[0]
+                if th_count == 0:
+                    return "Dump thread list is empty (no stack memory)."
+                # Check first thread has stack RVA
+                th0 = f.read(48)
+                if len(th0) < 40:
+                    return f"Dump contains {th_count} thread(s) but thread layout is unexpected."
+                stack_rva = struct.unpack('<I', th0[36:40])[0]
+                stack_size = struct.unpack('<I', th0[32:36])[0]
+                if stack_rva == 0 or stack_size == 0:
+                    return f"Dump has {th_count} thread(s) but stack memory descriptors are empty."
+                return f"Dump contains {th_count} thread(s) and stack memory (RVA 0x{stack_rva:X}, size {stack_size}). Extraction should be possible; if you see no stacks, report as analysis error."
+        except Exception as e:
+            return f"Could not verify dump structure: {e}"
 
     def _extract_native_stack(self, thread, reader) -> None:
         """Extract native stack trace from the crashing thread."""
@@ -1984,6 +3850,12 @@ class MemoryAnalyzer:
         # Extract assertion info
         self._extract_assertion_info(md)
 
+        # Extract JavaScriptData stream (20) - V8/Chakra context when present
+        self._extract_javascript_data(md)
+
+        # Extract ProcessVmCounters stream (22) - VM usage at crash
+        self._extract_process_vm_counters(md)
+
     def _extract_handle_data(self, md) -> None:
         """Extract handle data stream - open files, mutexes, etc at crash time."""
         try:
@@ -2030,6 +3902,44 @@ class MemoryAnalyzer:
 
         except Exception as e:
             self.result.errors.append(f"Handle data extraction: {e}")
+
+    def _add_evidence_from_handles(self) -> None:
+        """Add evidence from open file handles (resource paths) at crash time."""
+        if not self.result.handles:
+            return
+        # Match resources\resname or resources/resname or @resname/ in path
+        path_resource_re = re.compile(
+            r'(?:resources[/\\]([A-Za-z0-9_\-]{2,64})(?:[/\\]|$)|'
+            r'@([A-Za-z0-9_\-]{2,64})[/\\])',
+            re.IGNORECASE
+        )
+        for h in self.result.handles:
+            type_name = (h.type_name or '').strip()
+            object_name = (h.object_name or '').strip()
+            if not object_name:
+                continue
+            # File handle types: "File" is typical; some dumps use "File" in TypeName
+            if 'file' not in type_name.lower():
+                continue
+            # Extract resource name from path
+            resource_name: Optional[str] = None
+            for m in path_resource_re.finditer(object_name):
+                res = m.group(1) or m.group(2)
+                if res and self._is_valid_resource_name(res):
+                    resource_name = res
+                    break
+            if not resource_name:
+                resource_name = self._extract_resource_from_path(object_name)
+            if not resource_name or not self._is_valid_resource_name(resource_name):
+                continue
+            self._add_evidence(ScriptEvidence(
+                evidence_type=EvidenceType.HANDLE_PATH,
+                script_name='handle',
+                resource_name=resource_name,
+                file_path=object_name,
+                context="Open file handle at crash",
+                confidence=0.55,
+            ))
 
     def _extract_memory_info_list(self, md) -> None:
         """Extract memory info list with detailed permissions."""
@@ -2295,6 +4205,115 @@ class MemoryAnalyzer:
         except Exception as e:
             pass  # Assertion info is optional
 
+    # Str patterns for comment/assertion stream resource extraction (streams are already decoded)
+    _COMMENT_RESOURCE_PATTERNS = (
+        re.compile(r'resources[/\\]([A-Za-z0-9_\-]{2,64})(?:[/\\]|$)', re.IGNORECASE),
+        re.compile(r'@([A-Za-z0-9_\-]{2,64})[/\\]', re.IGNORECASE),
+        re.compile(r'(?:ensure|start)\s+([A-Za-z0-9_\-]{2,64})\s*(?:$|#|\r|\n)', re.IGNORECASE),
+        re.compile(r'resource[:\s]+["\']?([A-Za-z0-9_\-]{2,64})["\']?', re.IGNORECASE),
+    )
+
+    def _add_evidence_from_comment_and_assertion_streams(self) -> None:
+        """Scan comment and assertion streams for resource names and add evidence."""
+        texts: List[str] = []
+        if self.result.comment_stream_a:
+            texts.append(self.result.comment_stream_a)
+        if self.result.comment_stream_w:
+            texts.append(self.result.comment_stream_w)
+        if self.result.assertion_info:
+            for v in self.result.assertion_info.values():
+                if v and isinstance(v, str):
+                    texts.append(v)
+        if not texts:
+            return
+        seen: Set[Tuple[str, str]] = set()  # (resource_name, source) to avoid duplicate evidence
+        for text in texts:
+            for pattern in self._COMMENT_RESOURCE_PATTERNS:
+                for m in pattern.finditer(text):
+                    res = (m.group(1) or '').strip()
+                    if not res or not self._is_valid_resource_name(res):
+                        continue
+                    key = (res, 'comment_assertion')
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    self._add_evidence(ScriptEvidence(
+                        evidence_type=EvidenceType.RESOURCE_NAME,
+                        script_name='comment_assertion',
+                        resource_name=res,
+                        context="Comment/assertion stream",
+                        confidence=0.5,
+                    ))
+
+    def _extract_javascript_data(self, md) -> None:
+        """Extract JavaScriptData stream (20) - V8/Chakra JS context when present."""
+        try:
+            js_data = getattr(md, 'javascript_data', None) or getattr(md, 'JavaScriptData', None)
+            if not js_data:
+                directory = getattr(md, 'directory', None) or getattr(md, 'streams', None)
+                if directory and hasattr(directory, '__iter__'):
+                    for entry in directory:
+                        stream_type = getattr(entry, 'StreamType', None) or getattr(entry, 'stream_type', None)
+                        if stream_type == 20:  # JavaScriptDataStream
+                            js_data = getattr(entry, 'data', None)
+                            break
+            if not js_data:
+                return
+            out: Dict[str, Any] = {}
+            if hasattr(js_data, '__dict__'):
+                for k, v in js_data.__dict__.items():
+                    if not k.startswith('_') and v is not None:
+                        try:
+                            out[k] = str(v) if isinstance(v, bytes) else v
+                        except Exception:
+                            out[k] = "<unserializable>"
+            elif isinstance(js_data, bytes):
+                out["raw_size"] = len(js_data)
+                # Try to extract readable strings for stack/context
+                try:
+                    decoded = js_data.decode('utf-8', errors='replace')
+                    if decoded.strip():
+                        out["preview"] = decoded[:2000].strip()
+                except Exception:
+                    pass
+            else:
+                out["value"] = str(js_data)
+            if out:
+                self.result.javascript_data = out
+        except Exception as e:
+            pass  # JavaScriptData is optional
+
+    def _extract_process_vm_counters(self, md) -> None:
+        """Extract ProcessVmCounters stream (22) - VM usage at crash time."""
+        try:
+            vm_counters = getattr(md, 'process_vm_counters', None) or getattr(md, 'ProcessVmCounters', None)
+            if not vm_counters:
+                directory = getattr(md, 'directory', None) or getattr(md, 'streams', None)
+                if directory and hasattr(directory, '__iter__'):
+                    for entry in directory:
+                        stream_type = getattr(entry, 'StreamType', None) or getattr(entry, 'stream_type', None)
+                        if stream_type == 22:  # ProcessVmCountersStream
+                            vm_counters = getattr(entry, 'data', None)
+                            break
+            if not vm_counters:
+                return
+            out: Dict[str, Any] = {}
+            # MINIDUMP_PROCESS_VM_COUNTERS: PageFaultCount, PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage
+            for attr in ('PageFaultCount', 'PeakWorkingSetSize', 'WorkingSetSize', 'QuotaPeakPagedPoolUsage',
+                         'QuotaPagedPoolUsage', 'QuotaPeakNonPagedPoolUsage', 'QuotaNonPagedPoolUsage',
+                         'PagefileUsage', 'PeakPagefileUsage', 'PrivateUsage',
+                         'page_fault_count', 'peak_working_set_size', 'working_set_size',
+                         'quota_peak_paged_pool_usage', 'quota_paged_pool_usage',
+                         'quota_peak_non_paged_pool_usage', 'quota_non_paged_pool_usage',
+                         'pagefile_usage', 'peak_pagefile_usage', 'private_usage'):
+                val = getattr(vm_counters, attr, None)
+                if val is not None:
+                    out[attr] = int(val) if isinstance(val, (int, float)) else val
+            if out:
+                self.result.process_vm_counters = out
+        except Exception as e:
+            pass  # ProcessVmCounters is optional
+
     def get_diagnostic_info(self) -> str:
         """Get diagnostic information about what was read from the dump."""
         lines = []
@@ -2341,9 +4360,16 @@ class MemoryAnalyzer:
             lines.append(f"  {etype}: {count}")
         lines.append("")
 
-        # Resources found
+        # Resources found - show all resources mentioned (sorted by evidence count)
         lines.append(f"RESOURCES IDENTIFIED: {len(self.result.resources)}")
-        for name, info in list(self.result.resources.items())[:10]:
+        if self.result.resources and self.result.native_stack and not self.result.lua_stacks and not self.result.js_stacks:
+            lines.append("  (From memory scan; native stack alone does not contain resource names.)")
+        sorted_resources = sorted(
+            self.result.resources.items(),
+            key=lambda x: (x[1].evidence_count, x[0]),
+            reverse=True
+        )
+        for name, info in sorted_resources:
             lines.append(f"  {name}: {info.evidence_count} evidence items")
         lines.append("")
 
@@ -2399,6 +4425,25 @@ class MemoryAnalyzer:
                     lines.append(f"     Path: {suspect.path}")
             lines.append("")
 
+        # All resources mentioned (FiveM relevance - resources that could be involved)
+        if self.result.resources:
+            lines.append("ALL RESOURCES MENTIONED (may be involved or corrupted):")
+            lines.append("-" * 40)
+            # When only native stack was recovered, clarify that resource names come from memory scan
+            if self.result.native_stack and not self.result.lua_stacks and not self.result.js_stacks:
+                lines.append("  (Identified by scanning dump memory; native stack does not contain resource names.)")
+                lines.append("")
+            by_evidence = sorted(
+                self.result.resources.items(),
+                key=lambda x: (x[1].evidence_count, x[0]),
+                reverse=True
+            )
+            for name, info in by_evidence[:30]:
+                lines.append(f"  {name}: {info.evidence_count} evidence")
+            if len(self.result.resources) > 30:
+                lines.append(f"  ... and {len(self.result.resources) - 30} more")
+            lines.append("")
+
         # Script errors found
         if self.result.script_errors:
             lines.append("SCRIPT ERRORS FOUND IN MEMORY:")
@@ -2414,22 +4459,36 @@ class MemoryAnalyzer:
                 lines.append(f"  Message: {error.message[:200]}")
             lines.append("")
 
-        # Lua stack traces
+        # Lua stack traces (with resources involved per stack)
         if self.result.lua_stacks:
             lines.append("LUA STACK TRACES RECOVERED:")
             lines.append("-" * 40)
             for i, stack in enumerate(self.result.lua_stacks[:3], 1):
                 lines.append(f"\n  Stack Trace #{i}:")
+                resources = (
+                    self.result.lua_stack_resources[i - 1]
+                    if i - 1 < len(self.result.lua_stack_resources)
+                    else self._get_resources_for_lua_stack(stack)
+                )
+                if resources:
+                    lines.append(f"    Resources involved: {', '.join(resources)}")
                 for frame in stack[:10]:
                     c_marker = " [C]" if frame.is_c_function else ""
                     lines.append(f"    {frame.source}:{frame.line}: in {frame.function_name}{c_marker}")
             lines.append("")
 
-        # JS stack traces
+        # JS stack traces (with resources involved per stack)
         if self.result.js_stacks:
             lines.append("JAVASCRIPT STACK TRACES:")
             lines.append("-" * 40)
-            for trace in self.result.js_stacks[:10]:
+            for i, trace in enumerate(self.result.js_stacks[:10]):
+                resources = (
+                    self.result.js_stack_resources[i]
+                    if i < len(self.result.js_stack_resources)
+                    else self._get_resources_for_js_stack(trace)
+                )
+                if resources:
+                    lines.append(f"  Resources involved: {', '.join(resources)}")
                 lines.append(f"  {trace}")
             lines.append("")
 

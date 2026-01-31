@@ -5,6 +5,7 @@ script/resource pinpointing, and detailed error attribution.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -13,6 +14,46 @@ import tempfile
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple, Set
+
+# #region agent log
+_DEBUG_LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cursor", "debug.log")
+def _dlog(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_DEBUG_LOG), exist_ok=True)
+        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"hypothesisId": hypothesis_id, "location": location, "message": message, "data": data, "timestamp": __import__("time").time()}) + "\n")
+    except Exception:
+        pass
+
+def _dlog2(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: Dict[str, Any],
+    run_id: str = "run1",
+) -> None:
+    """Debug-mode log writer with required NDJSON fields."""
+    try:
+        os.makedirs(os.path.dirname(_DEBUG_LOG), exist_ok=True)
+        ts_ms = int(__import__("time").time() * 1000)
+        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "sessionId": "debug-session",
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": ts_ms,
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+# #endregion
 
 # Optional dependencies
 try:
@@ -78,13 +119,24 @@ class CrashReport:
     # Primary suspects
     primary_suspects: List[ResourceInfo] = field(default_factory=list)
 
+    # All resources identified (from memory scan); used to show names near native stack
+    resources: Dict[str, ResourceInfo] = field(default_factory=dict)
+
     # Script errors
     script_errors: List[ScriptError] = field(default_factory=list)
 
     # Stack traces
     lua_stacks: List[List[LuaStackFrame]] = field(default_factory=list)
+    lua_stack_resources: List[List[str]] = field(default_factory=list)  # resources involved per Lua stack
     js_stacks: List[str] = field(default_factory=list)
+    js_stack_resources: List[List[str]] = field(default_factory=list)  # resources involved per JS stack
     native_stacks: List[str] = field(default_factory=list)
+    # Symbolicated native stack (function names when PDB available); same length as native_stacks
+    native_stacks_symbolicated: List[str] = field(default_factory=list)
+    # True if FIVEM_SYMBOL_CACHE (or local_symbol_path) was set when symbolication ran (for message wording)
+    symbolication_had_local_path: bool = False
+    # Diagnostic when symbols failed: first modules we tried and paths checked (for troubleshooting)
+    symbolication_diagnostic: Optional[str] = None
 
     # Pattern matches
     crash_patterns: List[PatternMatch] = field(default_factory=list)
@@ -96,6 +148,10 @@ class CrashReport:
     # Resources from logs
     log_resources: List[str] = field(default_factory=list)
     log_errors: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Tie-breaking / confidence (from memory_analyzer)
+    primary_suspect_secondary: Optional[str] = None
+    primary_suspect_confidence: str = "medium"
 
     # All evidence
     all_evidence: List[ScriptEvidence] = field(default_factory=list)
@@ -139,12 +195,80 @@ class CrashReport:
     # Assertion info
     assertion_info: Dict[str, str] = field(default_factory=dict)
 
+    # JavaScriptData stream (20) - V8/JS context when present
+    javascript_data: Optional[Dict[str, Any]] = None
+    # ProcessVmCounters stream (22) - VM usage at crash
+    process_vm_counters: Optional[Dict[str, Any]] = None
+
+    # ===== MEMORY LEAK ANALYSIS DATA =====
+    # Entity creation/deletion tracking
+    entity_creations: List[Tuple[str, int]] = field(default_factory=list)
+    entity_deletions: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Timer tracking
+    timers_created: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Event handler tracking
+    event_handlers_registered: List[Tuple[str, int]] = field(default_factory=list)
+    event_handlers_removed: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Memory allocation tracking
+    memory_allocations: List[Tuple[str, int]] = field(default_factory=list)
+    memory_frees: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Memory leak indicators
+    memory_leak_indicators: List[Tuple[str, str, int]] = field(default_factory=list)
+    
+    # Pool exhaustion indicators
+    pool_exhaustion_indicators: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Database patterns
+    database_patterns: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # NUI/CEF patterns
+    nui_patterns: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # Network patterns
+    network_patterns: List[Tuple[str, int]] = field(default_factory=list)
+    
+    # State bag patterns
+    statebag_patterns: List[Tuple[str, int]] = field(default_factory=list)
+
 
 class Symbolicator:
-    """Symbol downloader and address resolver for Windows minidumps."""
+    """Symbol downloader and address resolver for Windows minidumps.
 
-    def __init__(self, symbol_server: str = "https://runtime.fivem.net/client/symbols/"):
+    Local symbol cache: set FIVEM_SYMBOL_CACHE to a folder path (e.g. D:\\symbolcache)
+    to load PDBs from disk when the server returns 404. Layout: cache/pdb_name/GUIDage/pdb_name
+    or cache/pdb_name/GUID/pdb_name or cache/pdb_name (flat).
+    """
+
+    # Timeout (seconds) for symbol server requests; increase if you see timeout errors
+    SYMBOL_DOWNLOAD_TIMEOUT = 30
+
+    # Fallback paths to check when FIVEM_SYMBOL_CACHE env var is not set
+    _DEFAULT_CACHE_PATHS = ("D:\\symbolcache", "C:\\symbolcache")
+
+    def __init__(
+        self,
+        symbol_server: str = "https://runtime.fivem.net/client/symbols/",
+        local_symbol_path: Optional[str] = None,
+    ):
         self.server = symbol_server
+        raw_path = (local_symbol_path or os.environ.get("FIVEM_SYMBOL_CACHE", "").strip()) or None
+        # Fallback: if env var not set, use first existing default path (e.g. when run from IDE, not run_analyzer.bat)
+        if not raw_path and sys.platform == "win32":
+            for p in self._DEFAULT_CACHE_PATHS:
+                if os.path.isdir(p):
+                    raw_path = p
+                    break
+        self._local_symbol_path = os.path.normpath(raw_path) if raw_path else None
+        # #region agent log
+        _dlog("local_cache", "core.Symbolicator.__init__", "local symbol path", {
+            "local_symbol_path": self._local_symbol_path,
+            "from_env": os.environ.get("FIVEM_SYMBOL_CACHE", "").strip() or None,
+        })
+        # #endregion
         self.process = None
         self.dbghelp = None
         self._initialized = False
@@ -185,7 +309,7 @@ class Symbolicator:
 
             url = urllib.parse.urljoin(self.server, cand)
             try:
-                r = requests.get(url, stream=True, timeout=10)
+                r = requests.get(url, stream=True, timeout=Symbolicator.SYMBOL_DOWNLOAD_TIMEOUT)
                 if r.status_code == 200:
                     fd, path = tempfile.mkstemp(suffix='_' + cand)
                     with os.fdopen(fd, 'wb') as f:
@@ -197,47 +321,200 @@ class Symbolicator:
                 continue
         return None
 
+    def _try_local_cache(
+        self, pdb_name: str, guid_str: str, combined: str, cache_key: str
+    ) -> Optional[str]:
+        """Try to find PDB in local cache. Tries exact GUID match first, then GUID-agnostic fallback (FiveM builds often compatible)."""
+        # #region agent log
+        _dlog2("H1", "core._try_local_cache.entry", "local cache lookup start", {
+            "pdb_name": pdb_name,
+            "guid_str": guid_str[:20] if guid_str else "",
+            "combined": combined[:20] if combined else "",
+            "local_path": self._local_symbol_path,
+        })
+        # #endregion
+        if not self._local_symbol_path or not os.path.isdir(self._local_symbol_path):
+            return None
+        pdb_basename = os.path.basename(pdb_name)
+        # Normalize: ensure we have .pdb for file matching
+        pdb_file = pdb_name if pdb_name.lower().endswith(".pdb") else pdb_name + ".pdb"
+        # Folder name variants (cache may use "citizen-game-main.pdb" or "citizen-game-main")
+        folder_variants = [pdb_name, pdb_file]
+        if pdb_name.lower().endswith(".pdb"):
+            folder_variants.append(pdb_name[:-4])  # without .pdb
+        folder_variants = list(dict.fromkeys(folder_variants))  # dedup
+
+        # 1. Exact paths: pdb_name/GUID+age/pdb, pdb_name/GUID/pdb, pdb_name/pdb
+        candidates = []
+        if combined:
+            candidates.append(os.path.join(self._local_symbol_path, pdb_name, combined, pdb_file))
+            candidates.append(os.path.join(self._local_symbol_path, pdb_name, combined, pdb_name))
+        if guid_str:
+            candidates.append(os.path.join(self._local_symbol_path, pdb_name, guid_str, pdb_file))
+            candidates.append(os.path.join(self._local_symbol_path, pdb_name, guid_str, pdb_name))
+        for folder in folder_variants:
+            candidates.append(os.path.join(self._local_symbol_path, folder, pdb_file))
+            candidates.append(os.path.join(self._local_symbol_path, folder, pdb_name))
+        # #region agent log
+        _dlog2("H1", "core._try_local_cache.exact_candidates", "exact path candidates", {
+            "pdb_name": pdb_name,
+            "folder_variants": folder_variants,
+            "candidates_count": len(candidates),
+            "candidates_sample": [c for c in candidates[:4]],
+        })
+        # #endregion
+        for c in candidates:
+            if c and os.path.isfile(c):
+                self._symbol_cache[cache_key] = c
+                # #region agent log
+                _dlog2("H1", "core._try_local_cache.found_exact", "found via exact path", {"path": c})
+                # #endregion
+                return c
+
+        # 2. Flexible scan: folder matching pdb_name (any variant), any subfolder with pdb file
+        try:
+            matched_folders = []
+            for sub in os.listdir(self._local_symbol_path):
+                if sub.lower() not in {v.lower() for v in folder_variants}:
+                    continue
+                matched_folders.append(sub)
+                subpath = os.path.join(self._local_symbol_path, sub)
+                if not os.path.isdir(subpath):
+                    continue
+                for fname in (pdb_file, pdb_name, pdb_basename):
+                    flat = os.path.join(subpath, fname)
+                    if os.path.isfile(flat):
+                        self._symbol_cache[cache_key] = flat
+                        # #region agent log
+                        _dlog2("H4", "core._try_local_cache.found_flat", "found via flat scan", {"path": flat})
+                        # #endregion
+                        return flat
+                for sub2 in os.listdir(subpath):
+                    for fname in (pdb_file, pdb_name, pdb_basename):
+                        candidate = os.path.join(subpath, sub2, fname)
+                        if os.path.isfile(candidate):
+                            self._symbol_cache[cache_key] = candidate
+                            # #region agent log
+                            _dlog2("H4", "core._try_local_cache.found_subfolder", "found via subfolder scan", {"path": candidate})
+                            # #endregion
+                            return candidate
+            # #region agent log
+            if matched_folders:
+                _dlog2("H4", "core._try_local_cache.matched_folders", "folders matched but no pdb file", {
+                    "pdb_name": pdb_name,
+                    "matched_folders": matched_folders[:5],
+                })
+            # #endregion
+        except OSError:
+            pass
+
+        # 3. GUID-agnostic walk: find any .pdb with matching name (FiveM PDBs often work across builds)
+        try:
+            found_any: List[str] = []
+            for root, _dirs, files in os.walk(self._local_symbol_path, topdown=True):
+                if len(found_any) > 50:
+                    break
+                for f in files:
+                    if (f == pdb_basename or f.lower() == pdb_basename.lower()
+                            or f == pdb_file or f.lower() == pdb_file.lower()):
+                        path = os.path.join(root, f)
+                        if os.path.isfile(path) and path.lower().endswith(".pdb"):
+                            found_any.append(path)
+                            if guid_str and len(guid_str) >= 8 and guid_str.upper() in path.upper():
+                                self._symbol_cache[cache_key] = path
+                                # #region agent log
+                                _dlog2("H4", "core._try_local_cache.found_walk_guid", "found via walk with GUID match", {"path": path})
+                                # #endregion
+                                return path
+            if found_any:
+                self._symbol_cache[cache_key] = found_any[0]
+                # #region agent log
+                _dlog2("H4", "core._try_local_cache.found_walk_any", "found via walk (any match)", {"path": found_any[0], "total_found": len(found_any)})
+                # #endregion
+                return found_any[0]
+            # #region agent log
+            _dlog2("H4", "core._try_local_cache.walk_not_found", "walk completed, no match", {
+                "pdb_name": pdb_name,
+                "pdb_basename": pdb_basename,
+                "pdb_file": pdb_file,
+            })
+            # #endregion
+        except OSError:
+            pass
+        return None
+
     def download_symbol_by_pdb(self, pdb_name: str, guid: str, age: int) -> Optional[str]:
         """Download symbol file using PDB name and GUID."""
-        if not HAS_REQUESTS or not pdb_name or not guid:
+        if not pdb_name:
             return None
 
         cache_key = f"{pdb_name}_{guid}_{age}"
         if cache_key in self._symbol_cache:
             return self._symbol_cache[cache_key]
 
-        guid_str = str(guid).upper().replace('-', '')
+        guid_str = str(guid).upper().replace('-', '') if guid else ''
         age_str = str(int(age)) if age is not None else '0'
         combined = guid_str + age_str
 
-        # Try primary path
-        path = f"{pdb_name}/{combined}/{pdb_name}"
-        url = urllib.parse.urljoin(self.server, path)
-        try:
-            r = requests.get(url, stream=True, timeout=10)
-            if r.status_code == 200:
-                fd, tmp = tempfile.mkstemp(suffix='_' + pdb_name)
-                with os.fdopen(fd, 'wb') as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
-                self._symbol_cache[cache_key] = tmp
-                return tmp
-        except Exception:
-            pass
+        # Try local symbol cache FIRST (user has PDBs locally; FiveM builds are often compatible)
+        if self._local_symbol_path:
+            found = self._try_local_cache(pdb_name, guid_str, combined, cache_key)
+            if found:
+                return found
 
-        # Try fallback path
-        try:
-            url2 = urllib.parse.urljoin(self.server, f"{pdb_name}/{guid_str}/{pdb_name}")
-            r2 = requests.get(url2, stream=True, timeout=8)
-            if r2.status_code == 200:
-                fd, tmp2 = tempfile.mkstemp(suffix='_' + pdb_name)
-                with os.fdopen(fd, 'wb') as f:
-                    for chunk in r2.iter_content(8192):
-                        f.write(chunk)
-                self._symbol_cache[cache_key] = tmp2
-                return tmp2
-        except Exception:
-            pass
+        # Try symbol server (only if requests available)
+        if HAS_REQUESTS and guid:
+            path = f"{pdb_name}/{combined}/{pdb_name}"
+            url = urllib.parse.urljoin(self.server, path)
+            try:
+                r = requests.get(url, stream=True, timeout=Symbolicator.SYMBOL_DOWNLOAD_TIMEOUT)
+                # #region agent log
+                _dlog("H3", "core.Symbolicator.download_symbol_by_pdb", "pdb download primary", {
+                    "url": url[:120],
+                    "status_code": r.status_code,
+                    "pdb_name": pdb_name,
+                })
+                # #endregion
+                if r.status_code == 200:
+                    fd, tmp = tempfile.mkstemp(suffix='_' + pdb_name)
+                    with os.fdopen(fd, 'wb') as f:
+                        for chunk in r.iter_content(8192):
+                            f.write(chunk)
+                    self._symbol_cache[cache_key] = tmp
+                    return tmp
+            except Exception as e:
+                # #region agent log
+                _dlog("H3", "core.Symbolicator.download_symbol_by_pdb", "pdb download primary exception", {"error": str(e)[:80], "pdb_name": pdb_name})
+                # #endregion
+                pass
+
+            # Try fallback path
+            try:
+                url2 = urllib.parse.urljoin(self.server, f"{pdb_name}/{guid_str}/{pdb_name}")
+                r2 = requests.get(url2, stream=True, timeout=Symbolicator.SYMBOL_DOWNLOAD_TIMEOUT)
+                # #region agent log
+                _dlog("H3", "core.Symbolicator.download_symbol_by_pdb_fallback", "pdb download fallback", {"url": url2[:120], "status_code": r2.status_code})
+                # #endregion
+                if r2.status_code == 200:
+                    fd, tmp2 = tempfile.mkstemp(suffix='_' + pdb_name)
+                    with os.fdopen(fd, 'wb') as f:
+                        for chunk in r2.iter_content(8192):
+                            f.write(chunk)
+                    self._symbol_cache[cache_key] = tmp2
+                    return tmp2
+            except Exception:
+                pass
+
+        # #region agent log
+        if self._local_symbol_path and pdb_name:
+            _dlog("local_cache", "core.Symbolicator.download_symbol_by_pdb.local", "local cache not found", {
+                "local_path": self._local_symbol_path,
+                "pdb_name": pdb_name,
+                "combined": combined,
+            })
+        elif not self._local_symbol_path:
+            _dlog("local_cache", "core.Symbolicator.download_symbol_by_pdb.no_local", "no local path set", {"pdb_name": pdb_name})
+        # #endregion
 
         return None
 
@@ -504,16 +781,132 @@ class CrashAnalyzer:
         'dinput8.dll': 'DirectInput (often ScriptHook)',
     }
 
-    def __init__(self):
-        """Initialize the crash analyzer."""
+    # Pre-compiled regex patterns for log analysis and string extraction
+    _LUA_ERROR_PATTERN = re.compile(
+        r'([A-Za-z0-9_\-/\\]+\.lua):(\d+):\s*(.+)',
+        re.IGNORECASE
+    )
+    _RESOURCE_PATTERN = re.compile(
+        # Match common FiveM lifecycle lines, while avoiding false positives from unrelated
+        # "Started <something>" phrases.
+        # - Started resource myresource
+        # - Started 'myresource'
+        r'(?:Starting|Started|Stopping|Stopped|Loading|Loaded|Ensuring|Ensured)\s+'
+        r'(?:resource\s+([A-Za-z0-9_\-]{2,64})|[\'"]([A-Za-z0-9_\-]{2,64})[\'"])',
+        re.IGNORECASE
+    )
+    _CITIZEN_ERROR_PATTERN = re.compile(
+        r'(?:SCRIPT\s*ERROR|Error\s*running|error\s*in).*?(?:@?([A-Za-z0-9_\-]+))?',
+        re.IGNORECASE
+    )
+    _CAMEL_CASE_PATTERN = re.compile(r'[A-Z][a-z]+(?:[A-Z][a-z]+)+')
+    # Extract resource name from log error content for log-based boost
+    _LOG_ERROR_RESOURCE_PATTERN = re.compile(
+        r'(?:resources[/\\]([A-Za-z0-9_\-]{2,64})(?:[/\\]|$)|'
+        # Only treat @<name>/... as a resource if it looks like a code path reference.
+        # This avoids noise from other @-prefixed strings in logs.
+        r'@([A-Za-z0-9_\-]{2,64})[/\\][^\s\r\n]{1,260}\.(?:lua|js|ts|cs)|'
+        # "Error running ... for resource <name>" or "error in resource <name>"
+        r'(?:\bfor\b|\bin\b)\s+resource\s+[\'\"]?([A-Za-z0-9_\-]{2,64})[\'\"]?)',
+        re.IGNORECASE
+    )
+
+    _RESOURCE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
+    _LOG_RESOURCE_STOPWORDS: Set[str] = {
+        # Common error-message words accidentally captured as "resources"
+        "no",
+        "bad",
+        "string",
+        "number",
+        "nil",
+        "table",
+        "function",
+        "userdata",
+        "boolean",
+        "true",
+        "false",
+        "error",
+        "script",
+        "resource",
+        "resources",
+        "loaded",
+        "loading",
+        "initialization",
+        "environments",
+        "api",
+        "id",
+        "attempt",
+        "expected",
+        "got",
+    }
+
+    def __init__(self, progress_callback=None):
+        """Initialize the crash analyzer.
+        
+        Args:
+            progress_callback: Optional callable(stage: str, progress: float, message: str)
+                             for receiving progress updates during analysis.
+        """
         self._has_minidump = HAS_MINIDUMP
-        self.memory_analyzer = MemoryAnalyzer()
+        self._progress_callback = progress_callback
+        self.memory_analyzer = MemoryAnalyzer(progress_callback=progress_callback)
 
         # Initialize symbolicator (Windows only)
         try:
             self.symbolicator = Symbolicator()
         except Exception:
             self.symbolicator = None
+
+        # Pre-compile crash patterns
+        self._compiled_crash_patterns = []
+        for pattern, details in self.CRASH_PATTERNS.items():
+            try:
+                compiled = re.compile(pattern, re.IGNORECASE)
+                self._compiled_crash_patterns.append((compiled, details))
+            except re.error:
+                continue
+
+    def _is_plausible_resource_name(self, name: Optional[str]) -> bool:
+        """Heuristic validation for resource names extracted from logs.
+
+        Goal: avoid promoting generic error-message words (e.g. "string", "bad") as resources.
+        """
+        if not name:
+            return False
+        s = str(name).strip().strip('"').strip("'")
+        if not s:
+            return False
+        sl = s.lower()
+        if len(sl) < 2 or len(sl) > 64:
+            return False
+        # Must contain at least one letter; reject pure numbers like "16" or "254".
+        if not any(c.isalpha() for c in sl):
+            return False
+        if sl in self._LOG_RESOURCE_STOPWORDS:
+            return False
+        if "." in sl or "/" in sl or "\\" in sl or ":" in sl:
+            return False
+        # Internal/runtime markers (not user resources)
+        if sl.startswith(("citizen-scripting-", "citizen-resources-", "cfx-fivem-", "cfx-fxserver-")):
+            return False
+        return bool(self._RESOURCE_NAME_RE.fullmatch(s))
+    
+    def set_progress_callback(self, callback) -> None:
+        """Set or update the progress callback.
+        
+        Args:
+            callback: callable(stage: str, progress: float, message: str) or None
+        """
+        self._progress_callback = callback
+        self.memory_analyzer._progress_callback = callback
+
+    def set_abort_check(self, abort_check) -> None:
+        """Set a callable that returns True when analysis should stop (e.g. user cancel).
+        
+        Args:
+            abort_check: callable() -> bool, or None to disable
+        """
+        self.memory_analyzer._abort_check = abort_check
 
     def _extract_strings(self, data: bytes, min_length: int = 4) -> List[str]:
         """Extract printable ASCII strings from binary data."""
@@ -536,7 +929,6 @@ class CrashAnalyzer:
         final: List[str] = []
 
         pattern_generic = re.compile(r'[A-Za-z0-9_]{%d,}' % min_length)
-        pattern_camel = re.compile(r'[A-Z][a-z]+(?:[A-Z][a-z]+)+')
 
         def _trim_repeated(s: str) -> str:
             if not s or len(s) < 4:
@@ -560,7 +952,7 @@ class CrashAnalyzer:
 
         for s in results:
             # CamelCase tokens
-            for m in pattern_camel.finditer(s):
+            for m in self._CAMEL_CASE_PATTERN.finditer(s):
                 token = _trim_repeated(m.group(0))
                 if token and token not in seen:
                     seen.add(token)
@@ -580,10 +972,9 @@ class CrashAnalyzer:
             return []
 
         found: List[PatternMatch] = []
-        text_lower = all_text.lower()
 
-        for pattern, details in self.CRASH_PATTERNS.items():
-            if re.search(pattern, text_lower):
+        for compiled, details in self._compiled_crash_patterns:
+            if compiled.search(all_text):
                 found.append(PatternMatch(
                     issue=details['issue'],
                     explanation=details['explanation'],
@@ -605,6 +996,223 @@ class CrashAnalyzer:
 
         return identified
 
+    # Regex to parse native stack frame: "ModuleName.exe + 0xOFFSET"
+    _NATIVE_FRAME_RE = re.compile(r'^(.+?)\s*\+\s*0x([0-9A-Fa-f]+)$', re.IGNORECASE)
+
+    def _derive_pdb_names_from_module(self, mod_name: str) -> List[str]:
+        """Derive possible PDB names when dump has no CvRecord. FiveM-specific mappings."""
+        base = os.path.basename(mod_name)
+        names: List[str] = []
+        if not base:
+            return names
+        # Direct: module.dll -> module.pdb
+        if "." in base:
+            stem = base.rsplit(".", 1)[0]
+            names.append(stem + ".pdb")
+        else:
+            names.append(base + ".pdb")
+        # FiveM main process exe -> CitizenGame.pdb, CitizenFX_SubProcess_game_3570_aslr.pdb
+        if "FiveM" in base and "GTAProcess" in base:
+            names.extend(["CitizenGame.pdb", "CitizenFX_SubProcess_game_3570_aslr.pdb"])
+        # citizen-* -> citizen-*.pdb (already added above)
+        return names
+
+    def _symbolicate_native_stack(self, report: 'Report') -> None:
+        """Resolve native stack frames to function names using PDBs when available.
+
+        Populates report.native_stacks_symbolicated. Each entry is either
+        '  module + 0xOFFSET  ->  function_name + 0xdisp' or the raw frame if resolution fails.
+        """
+        report.native_stacks_symbolicated = []
+        report.symbolication_had_local_path = bool(
+            getattr(self.symbolicator, '_local_symbol_path', None)
+        )
+        # #region agent log
+        _dlog("H1", "core._symbolicate_native_stack.entry", "symbolicate entry", {
+            "native_stacks_len": len(report.native_stacks) if report.native_stacks else 0,
+            "module_versions_len": len(report.module_versions) if report.module_versions else 0,
+            "symbolicator_is_none": self.symbolicator is None,
+        })
+        # #endregion
+        if not report.native_stacks or not self.symbolicator or not report.module_versions:
+            # #region agent log
+            _dlog("H1", "core._symbolicate_native_stack.early_return", "early return", {
+                "reason": "no_stacks" if not report.native_stacks else "no_symbolicator" if not self.symbolicator else "no_module_versions",
+            })
+            # #endregion
+            return
+
+        # Build module name -> (base_address, size, pdb_name, pdb_guid, pdb_age)
+        # Use both full name and basename so "FiveM_b3570_GTAProcess.exe" matches even when
+        # module_versions has a full path (e.g. C:\...\FiveM_b3570_GTAProcess.exe).
+        mod_map: Dict[str, Tuple[int, int, str, str, int]] = {}
+        for m in report.module_versions:
+            name = (m.name or '').strip()
+            if name:
+                entry = (
+                    getattr(m, 'base_address', 0) or 0,
+                    getattr(m, 'size', 0) or 0,
+                    getattr(m, 'pdb_name', '') or '',
+                    getattr(m, 'pdb_guid', '') or '',
+                    getattr(m, 'pdb_age', 0) or 0,
+                )
+                mod_map[name] = entry
+                basename = os.path.basename(name)
+                if basename and basename != name:
+                    mod_map[basename] = entry
+
+        # #region agent log
+        _dlog("H2", "core._symbolicate_native_stack.mod_map", "mod_map built", {
+            "mod_map_len": len(mod_map),
+            "sample_keys": list(mod_map.keys())[:5],
+        })
+        # #endregion
+
+        # Parse frames and collect unique modules
+        parsed: List[Tuple[str, int, int]] = []  # (module_name, base, offset)
+        for raw in report.native_stacks:
+            m = self._NATIVE_FRAME_RE.match((raw or '').strip())
+            if m:
+                mod_name = m.group(1).strip()
+                try:
+                    offset = int(m.group(2), 16)
+                except ValueError:
+                    report.native_stacks_symbolicated.append(raw)
+                    continue
+                info = mod_map.get(mod_name) or (mod_map.get(os.path.basename(mod_name)) if os.path.basename(mod_name) != mod_name else None)
+                if info:
+                    base, size, pdb_name, pdb_guid, pdb_age = info
+                    parsed.append((mod_name, base, offset))
+                else:
+                    parsed.append((mod_name, 0, offset))
+            else:
+                parsed.append(('', 0, 0))
+
+        # #region agent log
+        first_parsed = parsed[0] if parsed else None
+        first_mod_in_map = first_parsed and mod_map.get(first_parsed[0]) is not None if first_parsed else False
+        _dlog("H2", "core._symbolicate_native_stack.parsed", "first frame parsed", {
+            "first_parsed": first_parsed,
+            "first_mod_in_map": first_mod_in_map,
+            "parsed_with_base_count": sum(1 for p in parsed if len(p) >= 2 and p[1] != 0),
+        })
+        # #endregion
+
+        # Load PDBs for each unique module that appears in the stack
+        loaded_bases: Set[int] = set()
+        seen_bases: Set[int] = set()
+        failed_lookups: List[Tuple[str, str, str, int]] = []  # (mod_name, pdb_name, guid, age)
+        for mod_name, base, _ in parsed:
+            if not mod_name or base == 0 or base in seen_bases:
+                continue
+            seen_bases.add(base)
+            first_module = len(seen_bases) == 1  # Define at start of iteration
+            info = mod_map.get(mod_name) or (mod_map.get(os.path.basename(mod_name)) if os.path.basename(mod_name) != mod_name else None)
+            if not info:
+                continue
+            _, size, pdb_name, pdb_guid, pdb_age = info
+            pdb_path = None
+            if pdb_name and pdb_guid:
+                pdb_path = self.symbolicator.download_symbol_by_pdb(pdb_name, pdb_guid, pdb_age)
+            # Fallback: dump may point to internal PDB (e.g. CitizenFX_SubProcess_game_3570_aslr.pdb) which
+            # returns 404; try same GUID/age with module exe name (e.g. FiveM_b3570_GTAProcess.pdb).
+            if not pdb_path and pdb_guid and pdb_age is not None:
+                module_pdb = mod_name if mod_name.lower().endswith(".pdb") else (mod_name.rsplit(".", 1)[0] + ".pdb" if "." in mod_name else mod_name + ".pdb")
+                if module_pdb != pdb_name:
+                    pdb_path = self.symbolicator.download_symbol_by_pdb(module_pdb, pdb_guid, pdb_age)
+                    # #region agent log
+                    if len(seen_bases) <= 1:
+                        _dlog("H3", "core._symbolicate_native_stack.fallback_pdb", "tried module-named PDB", {"module_pdb": module_pdb, "pdb_path_got": pdb_path is not None})
+                    # #endregion
+            # Fallback: dump has no PDB info (CvRecord empty) - derive PDB name from module and try local cache.
+            # FiveM modules often lack PDB info in minidumps; local cache lookup by name usually works.
+            if not pdb_path and self.symbolicator._local_symbol_path:
+                derived_names = self._derive_pdb_names_from_module(mod_name)
+                # #region agent log
+                if first_module:
+                    _dlog("H5", "core._symbolicate_native_stack.derive_fallback", "trying derived PDB names", {
+                        "mod_name": mod_name,
+                        "derived_names": derived_names,
+                        "pdb_name_was_empty": not pdb_name,
+                        "pdb_guid_was_empty": not pdb_guid,
+                    })
+                # #endregion
+                for try_pdb in derived_names:
+                    pdb_path = self.symbolicator.download_symbol_by_pdb(try_pdb, "", 0)
+                    if pdb_path:
+                        # #region agent log
+                        _dlog("H5", "core._symbolicate_native_stack.derived_success", "found via derived name", {"try_pdb": try_pdb, "pdb_path": pdb_path})
+                        # #endregion
+                        break
+            if not pdb_path:
+                pdb_path = self.symbolicator.download_symbol(mod_name)
+            if pdb_path:
+                load_ret = self.symbolicator.load_module(base, pdb_path, mod_name, size)
+                # #region agent log
+                if first_module:
+                    _dlog("H3,H4,H5", "core._symbolicate_native_stack.load_attempt", "first module load", {
+                        "mod_name": mod_name,
+                        "base": base,
+                        "pdb_name": pdb_name or "",
+                        "pdb_guid_len": len(pdb_guid) if pdb_guid else 0,
+                        "pdb_path_got": True,
+                        "load_module_return": load_ret,
+                    })
+                # #endregion
+                loaded_bases.add(base)
+            else:
+                if pdb_name and pdb_guid and len(failed_lookups) < 5:
+                    failed_lookups.append((mod_name, pdb_name, pdb_guid, pdb_age or 0))
+            if not pdb_path and first_module:
+                # #region agent log
+                _dlog("H3", "core._symbolicate_native_stack.download_failed", "first module no pdb path", {
+                    "mod_name": mod_name,
+                    "base": base,
+                    "pdb_name": pdb_name or "",
+                    "pdb_guid_len": len(pdb_guid) if pdb_guid else 0,
+                })
+                # #endregion
+
+        # #region agent log
+        _dlog("H4,H5", "core._symbolicate_native_stack.after_load", "after load loop", {"loaded_bases_count": len(loaded_bases)})
+        # #endregion
+
+        # Build diagnostic when no symbols loaded (helps user troubleshoot GUID mismatch, wrong build, etc.)
+        if not loaded_bases and failed_lookups and getattr(self.symbolicator, "_local_symbol_path", None):
+            cache_path = self.symbolicator._local_symbol_path
+            lines = [
+                "Symbolication diagnostic (PDBs not found in cache):",
+                f"  Cache path: {cache_path}",
+                "  First modules we looked for:",
+            ]
+            for mod_name, pdb_name, guid, age in failed_lookups[:3]:
+                guid_clean = str(guid).upper().replace("-", "")
+                combined = f"{guid_clean}{age}"
+                path1 = os.path.join(cache_path, pdb_name, combined, pdb_name)
+                path2 = os.path.join(cache_path, pdb_name, guid_clean, pdb_name)
+                lines.append(f"    - {mod_name} (PDB: {pdb_name}, GUID: {guid_clean}, age: {age})")
+                lines.append(f"      Checked: {path1}")
+                lines.append(f"      Checked: {path2}")
+            lines.append("  Your crash may be from a different FiveM build than your PDBs. Each build has unique GUIDs.")
+            lines.append("  Ensure PDBs in your cache match the exact build that produced this dump.")
+            report.symbolication_diagnostic = "\n".join(lines)
+
+        # Symbolicate each frame
+        for i, raw in enumerate(report.native_stacks):
+            if i >= len(parsed):
+                report.native_stacks_symbolicated.append(raw)
+                continue
+            mod_name, base, offset = parsed[i]
+            full_addr = base + offset if base else 0
+            if full_addr and loaded_bases:
+                sym_name, disp = self.symbolicator.symbolicate_address(full_addr)
+                if sym_name:
+                    report.native_stacks_symbolicated.append(
+                        f"  {raw}  ->  {sym_name} + 0x{disp:X}"
+                    )
+                    continue
+            report.native_stacks_symbolicated.append(raw)
+
     def analyze_log(self, log_path: str) -> Dict[str, Any]:
         """Analyze a log file for errors and resource information."""
         info: Dict[str, Any] = {
@@ -618,10 +1226,12 @@ class CrashAnalyzer:
         }
 
         content = None
+        used_encoding: Optional[str] = None
         for encoding in ['utf-8', 'utf-16', 'latin-1', 'cp1252']:
             try:
                 with open(log_path, 'r', encoding=encoding) as f:
                     content = f.read()
+                used_encoding = encoding
                 break
             except Exception:
                 continue
@@ -632,20 +1242,6 @@ class CrashAnalyzer:
 
         lines = content.splitlines()
 
-        # Patterns for log analysis
-        lua_error_pattern = re.compile(
-            r'([A-Za-z0-9_\-/\\]+\.lua):(\d+):\s*(.+)',
-            re.IGNORECASE
-        )
-        resource_pattern = re.compile(
-            r'(?:resource|script|started|stopped|Starting|Stopping)\s+[\'\"]?([A-Za-z0-9_\-]+)[\'\"]?',
-            re.IGNORECASE
-        )
-        citizen_error_pattern = re.compile(
-            r'(?:SCRIPT\s*ERROR|Error\s*running|error\s*in).*?(?:@?([A-Za-z0-9_\-]+))?',
-            re.IGNORECASE
-        )
-
         for i, line in enumerate(lines):
             l = line.strip()
             lower = l.lower()
@@ -655,7 +1251,7 @@ class CrashAnalyzer:
                 info['errors'].append({'line': i + 1, 'content': l[:300]})
 
                 # Check for Lua errors
-                lua_match = lua_error_pattern.search(l)
+                lua_match = self._LUA_ERROR_PATTERN.search(l)
                 if lua_match:
                     info['lua_errors'].append({
                         'file': lua_match.group(1),
@@ -665,7 +1261,7 @@ class CrashAnalyzer:
                     })
 
                 # Check for Citizen/FiveM errors
-                citizen_match = citizen_error_pattern.search(l)
+                citizen_match = self._CITIZEN_ERROR_PATTERN.search(l)
                 if citizen_match:
                     resource = citizen_match.group(1)
                     info['script_errors'].append({
@@ -679,11 +1275,17 @@ class CrashAnalyzer:
                 info['warnings'].append({'line': i + 1, 'content': l[:200]})
 
             # Detect resources
-            resource_match = resource_pattern.search(l)
+            resource_match = self._RESOURCE_PATTERN.search(l)
             if resource_match:
-                res = resource_match.group(1)
-                if res and res not in info['resources'] and len(res) > 1:
+                res = resource_match.group(1) or resource_match.group(2)
+                if self._is_plausible_resource_name(res) and res not in info['resources']:
                     info['resources'].append(res)
+
+            # Also extract resources from common error/path formats (e.g. "@res/path.lua")
+            for m in self._LOG_ERROR_RESOURCE_PATTERN.finditer(l):
+                for g in (m.group(1), m.group(2), m.group(3)):
+                    if self._is_plausible_resource_name(g) and g not in info['resources']:
+                        info['resources'].append(g)
 
             # Detect stack traces
             if 'stack trace' in lower or 'call stack' in lower or 'traceback' in lower:
@@ -692,6 +1294,29 @@ class CrashAnalyzer:
                     'line': i + 1,
                     'context': context
                 })
+
+        # #region agent log
+        _dlog2(
+            "H7",
+            "core.CrashAnalyzer.analyze_log",
+            "log summary",
+            {
+                "file": os.path.basename(log_path),
+                "encoding": used_encoding,
+                "lines": len(lines),
+                "errors": len(info.get("errors", [])),
+                "warnings": len(info.get("warnings", [])),
+                "resources": len(info.get("resources", [])),
+                "lua_errors": len(info.get("lua_errors", [])),
+                "script_errors": len(info.get("script_errors", [])),
+                "resources_sample": list(info.get("resources", [])[:20]),
+                "lua_error_files_sample": [e.get("file") for e in info.get("lua_errors", [])[:3]],
+                "script_error_resources_sample": [
+                    e.get("resource") for e in info.get("script_errors", [])[:5] if e.get("resource")
+                ],
+            },
+        )
+        # #endregion
 
         return info
 
@@ -762,9 +1387,14 @@ class CrashAnalyzer:
             report.exception_address = deep_result.exception_address
             report.exception_module = deep_result.exception_module
             report.primary_suspects = deep_result.primary_suspects
+            report.resources = getattr(deep_result, 'resources', {}) or {}
+            report.primary_suspect_secondary = getattr(deep_result, 'primary_suspect_secondary', None)
+            report.primary_suspect_confidence = getattr(deep_result, 'primary_suspect_confidence', 'medium')
             report.script_errors = deep_result.script_errors
             report.lua_stacks = deep_result.lua_stacks
+            report.lua_stack_resources = getattr(deep_result, 'lua_stack_resources', [])
             report.js_stacks = deep_result.js_stacks
+            report.js_stack_resources = getattr(deep_result, 'js_stack_resources', [])
             report.native_stacks = deep_result.native_stack
             report.all_evidence = deep_result.all_evidence
             report.analysis_errors.extend(deep_result.errors)
@@ -781,27 +1411,43 @@ class CrashAnalyzer:
             report.handles = deep_result.handles
             report.threads_extended = deep_result.threads_extended
             report.module_versions = deep_result.module_versions
+            # Symbolicate native stack when PDBs available (Windows)
+            self._symbolicate_native_stack(report)
             report.memory_info = deep_result.memory_info
             report.process_stats = deep_result.process_stats
             report.function_table_entries = deep_result.function_table_entries
             report.comment_stream_a = deep_result.comment_stream_a
             report.comment_stream_w = deep_result.comment_stream_w
             report.assertion_info = deep_result.assertion_info
+            report.javascript_data = deep_result.javascript_data
+            report.process_vm_counters = deep_result.process_vm_counters
 
-            # Basic dump analysis for patterns
-            basic_dump = self.analyze_dump(dump_path)
-            if 'modules' in basic_dump:
-                for mod in basic_dump['modules']:
-                    report.modules.append({'name': mod})
+            # ===== MEMORY LEAK ANALYSIS DATA =====
+            report.entity_creations = deep_result.entity_creations
+            report.entity_deletions = deep_result.entity_deletions
+            report.timers_created = deep_result.timers_created
+            report.event_handlers_registered = deep_result.event_handlers_registered
+            report.event_handlers_removed = deep_result.event_handlers_removed
+            report.memory_allocations = deep_result.memory_allocations
+            report.memory_frees = deep_result.memory_frees
+            report.memory_leak_indicators = deep_result.memory_leak_indicators
+            report.pool_exhaustion_indicators = deep_result.pool_exhaustion_indicators
+            report.database_patterns = deep_result.database_patterns
+            report.nui_patterns = deep_result.nui_patterns
+            report.network_patterns = deep_result.network_patterns
+            report.statebag_patterns = deep_result.statebag_patterns
 
+            # Use raw_strings and module_names from deep analysis (avoids re-reading dump)
+            if deep_result.raw_strings:
+                all_strings = ' '.join(deep_result.raw_strings)
+                patterns = self.match_patterns(all_strings)
+                report.crash_patterns = patterns
+            if deep_result.module_names:
+                for name in deep_result.module_names:
+                    report.modules.append({'name': name})
             # Identify known modules
             module_names = [m['name'] for m in report.modules if 'name' in m]
             report.identified_modules = self.identify_modules(module_names)
-
-            # Match crash patterns
-            all_strings = ' '.join(basic_dump.get('raw_data', []))
-            patterns = self.match_patterns(all_strings)
-            report.crash_patterns = patterns
 
         # Analyze log files
         if log_paths:
@@ -825,7 +1471,118 @@ class CrashAnalyzer:
                         if p not in report.crash_patterns:
                             report.crash_patterns.append(p)
 
+        # Use log data to boost or disambiguate suspects
+        self._apply_log_resource_boost(report)
+
+        # #region agent log
+        _dlog2(
+            "H8",
+            "core.CrashAnalyzer.full_analysis",
+            "post-boost summary",
+            {
+                "has_dump": bool(report.dump_file),
+                "log_files": len(report.log_files),
+                "log_resources": len(report.log_resources),
+                "log_errors": len(report.log_errors),
+                "primary_suspects_count": len(report.primary_suspects),
+                "primary_suspects_top5": [s.name for s in report.primary_suspects[:5]],
+                "primary_suspect_confidence": getattr(report, "primary_suspect_confidence", None),
+            },
+        )
+        # #endregion
+
         return report
+
+    def _apply_log_resource_boost(self, report: CrashReport) -> None:
+        """Merge log resources into the picture and boost suspects that appear in logs."""
+        # Ensure resources that appear only in logs are in report.resources
+        for res in report.log_resources:
+            res = (res or '').strip()
+            if not self._is_plausible_resource_name(res):
+                continue
+            if res not in report.resources:
+                report.resources[res] = ResourceInfo(name=res)
+
+        # Extract resource names mentioned in log error content
+        resources_mentioned_in_errors: Set[str] = set()
+        error_resource_hits: Dict[str, int] = {}
+        for err in report.log_errors:
+            content = err.get('content', '') or ''
+            for m in self._LOG_ERROR_RESOURCE_PATTERN.finditer(content):
+                for g in (m.group(1), m.group(2), m.group(3)):
+                    if self._is_plausible_resource_name(g):
+                        resources_mentioned_in_errors.add(g)
+                        error_resource_hits[g] = error_resource_hits.get(g, 0) + 1
+
+        # Treat resources mentioned in log error content as strong evidence (even if they didn't appear
+        # in start/stop lines). This helps minimal dumps where the .dmp lacks Lua/JS stacks.
+        for res in sorted(resources_mentioned_in_errors):
+            if res not in report.resources:
+                report.resources[res] = ResourceInfo(name=res)
+            info = report.resources[res]
+            # Add minimal evidence signal so these can rank above "presence-only" resources.
+            try:
+                info.evidence_types.add(EvidenceType.ERROR_MESSAGE)
+            except Exception:
+                pass
+            try:
+                info.evidence_count += 2 + min(3, error_resource_hits.get(res, 0))
+            except Exception:
+                pass
+            # Add a small note (no full log line to avoid leaking sensitive details)
+            try:
+                note = f"[LOG_ERROR] Mentioned in {error_resource_hits.get(res, 0)} error line(s)"
+                if note not in info.context_details and len(info.context_details) < 10:
+                    info.context_details.append(note)
+            except Exception:
+                pass
+
+        # Reorder primary_suspects: put resources that appear in logs first
+        log_boost_names = set(report.log_resources) | resources_mentioned_in_errors
+        if log_boost_names and report.primary_suspects:
+            # Prioritize error-mentioned resources above generic log resources.
+            error_infos = [report.resources[r] for r in resources_mentioned_in_errors if r in report.resources]
+            # Rank error resources by number of hits in error lines first.
+            error_infos_sorted = sorted(
+                error_infos,
+                key=lambda x: (error_resource_hits.get(x.name, 0), getattr(x, "evidence_count", 0), x.name),
+                reverse=True,
+            )
+            error_names = {i.name for i in error_infos_sorted}
+            rest = [s for s in report.primary_suspects if s.name not in error_names]
+            # Keep log-start/stop resources next, then everything else.
+            in_logs = [s for s in rest if s.name in report.log_resources]
+            not_in_logs = [s for s in rest if s not in in_logs]
+            report.primary_suspects = error_infos_sorted + in_logs + not_in_logs
+
+        # Add log-only resources as additional suspects (up to 5) if not already in list
+        primary_names = {s.name for s in report.primary_suspects}
+        added = 0
+        # Consider both "log resources" and "error-mentioned resources" for addition.
+        add_candidates = list(report.log_resources) + sorted(resources_mentioned_in_errors)
+        for res in add_candidates:
+            if added >= 5:
+                break
+            if res in report.resources and res not in primary_names:
+                report.primary_suspects.append(report.resources[res])
+                primary_names.add(res)
+                added += 1
+
+        # #region agent log
+        _dlog2(
+            "H9",
+            "core.CrashAnalyzer._apply_log_resource_boost",
+            "log boost details",
+            {
+                "log_resources_count": len(report.log_resources),
+                "log_resources_sample": list(report.log_resources[:15]),
+                "error_resources_count": len(resources_mentioned_in_errors),
+                "error_resources_sample": sorted(list(resources_mentioned_in_errors))[:15],
+                "error_resource_hits_sample": dict(list(error_resource_hits.items())[:10]),
+                "primary_suspects_top5": [s.name for s in report.primary_suspects[:5]],
+            },
+        )
+        # #endregion
 
     def generate_report(self, dump_info: Optional[Dict[str, Any]] = None,
                        log_infos: Optional[List[Dict[str, Any]]] = None) -> str:
@@ -961,9 +1718,18 @@ class CrashAnalyzer:
             lines.append("=" * 70)
             lines.append("PRIMARY SUSPECTS - MOST LIKELY CRASH CAUSES")
             lines.append("=" * 70)
+            sec = getattr(report, 'primary_suspect_secondary', None)
+            conf = getattr(report, 'primary_suspect_confidence', 'medium')
+            if sec:
+                lines.append("  (Top two suspects have close scores; consider both.)")
+            if conf == "low":
+                lines.append("  (Confidence is low; correlate with stack traces below.)")
+            lines.append("")
             for i, suspect in enumerate(report.primary_suspects[:5], 1):
                 lines.append("")
                 lines.append(f"  #{i} RESOURCE: {suspect.name}")
+                if getattr(suspect, 'likely_script', None):
+                    lines.append(f"      Likely script: {suspect.likely_script}")
                 lines.append(f"      Evidence Score: {suspect.evidence_count}")
                 lines.append(f"      Evidence Types: {', '.join(e.name for e in suspect.evidence_types)}")
                 if suspect.scripts:
@@ -987,31 +1753,74 @@ class CrashAnalyzer:
                 lines.append(f"  Message: {err.message[:200]}")
             lines.append("")
 
-        # Lua stack traces
+        # Lua stack traces (with resources involved per stack)
         if report.lua_stacks:
             lines.append("LUA STACK TRACES:")
             lines.append("-" * 40)
             for i, stack in enumerate(report.lua_stacks[:3], 1):
                 lines.append(f"\n  Stack #{i}:")
+                if i - 1 < len(report.lua_stack_resources) and report.lua_stack_resources[i - 1]:
+                    lines.append(f"    Resources involved: {', '.join(report.lua_stack_resources[i - 1])}")
                 for frame in stack[:8]:
                     func = frame.function_name or '(anonymous)'
                     lines.append(f"    {frame.source}:{frame.line} in {func}")
             lines.append("")
 
-        # JS stack traces
+        # JS stack traces (with resources involved per stack)
         if report.js_stacks:
             lines.append("JAVASCRIPT STACK TRACES:")
             lines.append("-" * 40)
-            for trace in report.js_stacks[:10]:
+            for i, trace in enumerate(report.js_stacks[:10]):
+                if i < len(report.js_stack_resources) and report.js_stack_resources[i]:
+                    lines.append(f"  Resources involved: {', '.join(report.js_stack_resources[i])}")
                 lines.append(f"  {trace}")
             lines.append("")
 
-        # Native stack traces
+        # Native stack traces (with symbolication when PDBs available)
         if report.native_stacks:
             lines.append("NATIVE STACK TRACE (Crashing Thread):")
             lines.append("-" * 40)
-            for frame in report.native_stacks:
-                lines.append(f"  {frame}")
+            # Show resource names right here so user can correlate
+            resources_for_stack = []
+            if report.primary_suspects:
+                resources_for_stack = [s.name for s in report.primary_suspects[:10]]
+            elif report.resources:
+                by_ev = sorted(
+                    report.resources.items(),
+                    key=lambda x: (getattr(x[1], 'evidence_count', 0), x[0]),
+                    reverse=True
+                )
+                resources_for_stack = [name for name, _ in by_ev[:10]]
+            if resources_for_stack:
+                lines.append("Resources identified in this dump (correlate with stack below):")
+                lines.append("  " + ", ".join(resources_for_stack))
+                lines.append("")
+            # How to use this to find the cause
+            lines.append("How to use this to find the cause:")
+            lines.append("  - Top frames are closest to the crash; the exception address points to the faulting instruction.")
+            lines.append("  - When symbols are loaded (PDB), each frame shows:  module + 0xOFFSET  ->  function_name + 0xdisp")
+            lines.append("  - Correlate the resources above with the stack to see which script may have triggered this path.")
+            lines.append("")
+            has_symbolication = report.native_stacks_symbolicated and any("  ->  " in f for f in report.native_stacks_symbolicated)
+            if not has_symbolication and report.native_stacks:
+                if report.module_versions:
+                    if getattr(report, 'symbolication_had_local_path', False):
+                        lines.append("  (Symbols not loaded: PDB not found on FiveM symbol server or in local cache. Ensure FIVEM_SYMBOL_CACHE folder has PDBs for this build (e.g. <pdb_name>/<GUID><age>/<pdb_name>). Showing module+offset only.)")
+                        diag = getattr(report, 'symbolication_diagnostic', None)
+                        if diag:
+                            lines.append("")
+                            lines.append(diag)
+                    else:
+                        lines.append("  (Symbols not loaded: PDB not found on FiveM symbol server (404). To use local PDBs, set FIVEM_SYMBOL_CACHE in .env to your symbol folder (e.g. D:\\symbolcache). Showing module+offset only.)")
+                else:
+                    lines.append("  (Symbols not loaded: PDB download failed or module info missing. Showing module+offset only.)")
+                lines.append("")
+            elif has_symbolication:
+                lines.append("  (Symbols loaded from server or local cache; correlate the function names below with the resources list to identify the crashing resource.)")
+                lines.append("")
+            display_frames = report.native_stacks_symbolicated if report.native_stacks_symbolicated else report.native_stacks
+            for frame in display_frames:
+                lines.append(frame if (frame and frame.startswith("  ")) else f"  {frame}")
             lines.append("")
 
         # Crash patterns
@@ -1271,11 +2080,20 @@ class CrashAnalyzer:
 
         if report.primary_suspects:
             top = report.primary_suspects[0]
-            lines.append(f"MOST LIKELY CAUSE: Resource '{top.name}'")
+            sec = getattr(report, 'primary_suspect_secondary', None)
+            conf = getattr(report, 'primary_suspect_confidence', 'medium')
+            if sec:
+                lines.append(f"MOST LIKELY CAUSE: Resource '{top.name}' (or '{sec}' if evidence is ambiguous)")
+            else:
+                lines.append(f"MOST LIKELY CAUSE: Resource '{top.name}'")
+            if getattr(top, 'likely_script', None):
+                lines.append(f"  Likely script: {top.likely_script}")
             if top.scripts:
                 lines.append(f"  Scripts: {', '.join(top.scripts[:3])}")
             lines.append(f"  Evidence: {top.evidence_count} items")
             lines.append(f"  Types: {', '.join(e.name for e in list(top.evidence_types)[:3])}")
+            if conf == "low":
+                lines.append("  (Consider investigating the resources listed below; confidence is low.)")
         elif report.script_errors:
             err = report.script_errors[0]
             lines.append(f"SCRIPT ERROR DETECTED:")
@@ -1289,155 +2107,5 @@ class CrashAnalyzer:
         else:
             lines.append("Unable to pinpoint specific cause.")
             lines.append("Check the full report for more details.")
-
-        return "\n".join(lines)
-
-    def get_diagnostic_recommendations(self, report: CrashReport) -> str:
-        """Generate recommendations for gathering additional diagnostic information."""
-        lines = []
-        lines.append("=" * 70)
-        lines.append("ADDITIONAL DIAGNOSTIC INFORMATION THAT WOULD HELP")
-        lines.append("=" * 70)
-        lines.append("")
-
-        # Check what we already have
-        has_logs = bool(report.log_files and report.log_errors)
-        has_suspects = bool(report.primary_suspects)
-        has_script_errors = bool(report.script_errors)
-        has_stacks = bool(report.lua_stacks or report.js_stacks)
-
-        # Determine crash type
-        is_graphics_crash = any('Graphics Driver' in p.issue for p in report.crash_patterns)
-        is_oom = any('Out of Memory' in p.issue for p in report.crash_patterns)
-        is_access_violation = report.exception_code == 0xC0000005 if report.exception_code else False
-
-        lines.append("1. FIVEM LOG FILES (Most Important!):")
-        lines.append("-" * 40)
-        if not has_logs or not has_script_errors:
-            lines.append("  ⚠ MISSING - These provide critical context!")
-        else:
-            lines.append("  ✓ Provided")
-        lines.append("")
-        lines.append("  Location: %LocalAppData%\\FiveM\\FiveM.app\\logs\\")
-        lines.append("  Files to include:")
-        lines.append("    • CitizenFX.log (main client log)")
-        lines.append("    • CitizenFX_log_*.txt (previous sessions)")
-        lines.append("    • crashes.log (crash history)")
-        lines.append("  These contain script errors, resource loading, and detailed stack traces.")
-        lines.append("")
-
-        lines.append("2. SERVER CONSOLE LOGS:")
-        lines.append("-" * 40)
-        lines.append("  If available, server-side logs showing:")
-        lines.append("    • Resource loading/errors before crash")
-        lines.append("    • Server-side script errors")
-        lines.append("    • Player events leading to crash")
-        lines.append("  Location: [Server Directory]/console.log or txAdmin logs")
-        lines.append("")
-
-        lines.append("3. SYSTEM INFORMATION:")
-        lines.append("-" * 40)
-        if is_graphics_crash:
-            lines.append("  ⚠ IMPORTANT for Graphics Driver crashes!")
-        lines.append("  Helpful information:")
-        lines.append("    • Graphics card model and driver version")
-        lines.append("    • RAM amount (Total/Available)")
-        lines.append("    • Windows version")
-        lines.append("    • FiveM build number")
-        lines.append("  To get: Run 'dxdiag' and save the report")
-        lines.append("")
-
-        lines.append("4. FIVEM SETTINGS & CONFIGURATION:")
-        lines.append("-" * 40)
-        lines.append("  Files to include:")
-        lines.append("    • fivem_set.bin (game settings)")
-        lines.append("    • caches.xml (resource cache info)")
-        lines.append("    • %LocalAppData%\\FiveM\\FiveM.app\\crashes.xml")
-        lines.append("")
-
-        lines.append("5. CRASH CONTEXT:")
-        lines.append("-" * 40)
-        lines.append("  Information that helps:")
-        lines.append("    • What were you doing when it crashed?")
-        lines.append("    • Does it crash consistently or randomly?")
-        lines.append("    • Recent changes (new resources, game update, driver update)?")
-        lines.append("    • How long into gameplay does it crash?")
-        lines.append("    • Any error messages before crash?")
-        lines.append("")
-
-        # Specific recommendations based on crash type
-        lines.append("=" * 70)
-        lines.append("SPECIFIC RECOMMENDATIONS FOR THIS CRASH:")
-        lines.append("=" * 70)
-        lines.append("")
-
-        if is_graphics_crash:
-            lines.append("This appears to be a GRAPHICS DRIVER CRASH:")
-            lines.append("  • Update GPU drivers (NVIDIA/AMD)")
-            lines.append("  • Lower graphics settings in-game")
-            lines.append("  • Disable ReShade/ENB if installed")
-            lines.append("  • Check GPU temperature (might be overheating)")
-            lines.append("  • Verify game files integrity")
-            lines.append("  • Try running in DX10/DX11 mode instead of Vulkan (or vice versa)")
-            lines.append("")
-
-        if is_oom:
-            lines.append("This appears to be an OUT OF MEMORY crash:")
-            lines.append("  • Check your server's streaming assets (reduce if excessive)")
-            lines.append("  • Limit number of active resources")
-            lines.append("  • Look for memory leaks in custom scripts")
-            lines.append("  • Increase system RAM if <16GB")
-            lines.append("  • Check for scripts that don't clean up entities/objects")
-            lines.append("")
-
-        if is_access_violation and not has_suspects:
-            lines.append("ACCESS VIOLATION with no specific resource identified:")
-            lines.append("  • Likely a native code issue or corrupted game files")
-            lines.append("  • Verify GTA V game files via Steam/Epic")
-            lines.append("  • Update FiveM to latest version")
-            lines.append("  • Disable recently added native DLLs/mods")
-            lines.append("  • Check CitizenFX.log for script errors leading up to crash")
-            lines.append("")
-
-        if not has_stacks and not has_script_errors:
-            lines.append("NO SCRIPT CONTEXT FOUND in dumps:")
-            lines.append("  • This usually means crash is in native/engine code")
-            lines.append("  • CitizenFX.log is CRITICAL to understand what scripts were running")
-            lines.append("  • Check if crash happens with ALL resources disabled")
-            lines.append("  • Try with minimal resource set to isolate issue")
-            lines.append("")
-
-        # How to use logs with analyzer
-        lines.append("=" * 70)
-        lines.append("HOW TO ANALYZE WITH THESE FILES:")
-        lines.append("=" * 70)
-        lines.append("")
-        lines.append("1. In the analyzer GUI:")
-        lines.append("   • Select .dmp files (you've done this)")
-        lines.append("   • Click 'Select Log Files' and add:")
-        lines.append("      - CitizenFX.log")
-        lines.append("      - server console logs (if available)")
-        lines.append("   • Click 'Analyze' again")
-        lines.append("")
-        lines.append("2. The analyzer will extract:")
-        lines.append("   • Script errors from logs")
-        lines.append("   • Resource loading order")
-        lines.append("   • Events before crash")
-        lines.append("   • Correlated with memory dump data")
-        lines.append("")
-
-        lines.append("=" * 70)
-        lines.append("QUICK CHECKLIST:")
-        lines.append("=" * 70)
-        status = "✓" if has_logs else "☐"
-        lines.append(f"  {status} CitizenFX.log included")
-        status = "✓" if has_suspects else "☐"
-        lines.append(f"  {status} Specific resource identified")
-        status = "✓" if has_stacks else "☐"
-        lines.append(f"  {status} Stack traces found")
-        lines.append("  ☐ GPU driver version checked")
-        lines.append("  ☐ Recent changes documented")
-        lines.append("  ☐ Crash reproduction steps known")
-        lines.append("")
 
         return "\n".join(lines)
