@@ -2,16 +2,21 @@
 
 A professional crash dump and memory leak analyzer specifically designed for FiveM servers. Identifies resources causing crashes, tracks memory leaks, and provides detailed heap timeline analysis.
 
+**Version:** 2.1.0
+
 ![Crash Analyzer](icon.png)
 
 ## Features
 
 - **Minidump Analysis**: Parse Windows crash dumps (`.dmp` files) to identify crashing resources
+- **Deep Memory Analysis**: Script/resource pinpointing, Lua and JavaScript stack trace extraction, and FiveM-specific crash pattern detection
+- **Native Symbolication**: Optional local PDB symbol cache for function names in native stack frames (see Configuration)
 - **Memory Leak Detection**: Analyze V8 heap timeline snapshots to detect memory leaks from specific resources
 - **FiveM-Optimized**: Thresholds and patterns tuned specifically for FiveM server environments
 - **Rich GUI**: Modern PySide6 interface with separate tabs for crashes and memory analysis
 - **Resource Attribution**: Advanced edge traversal algorithm attributes memory usage to specific FiveM resources
 - **Severity Classification**: Automatically classifies issues as CRITICAL, HIGH, MEDIUM, or LOW priority
+- **Extended Minidump Data**: Handles, threads, module version info, memory regions, and process statistics for deeper diagnostics
 
 ## Installation
 
@@ -26,7 +31,7 @@ A professional crash dump and memory leak analyzer specifically designed for Fiv
 1. Clone the repository:
 ```bash
 git clone https://github.com/mpriester8/FiveMCrashAnalyzer-releases.git
-cd FiveM-CrashAnalyzer
+cd FiveMCrashAnalyzer-releases
 ```
 
 2. Install dependencies:
@@ -43,6 +48,17 @@ Or use the batch file on Windows:
 ```bash
 run_analyzer.bat
 ```
+
+### Configuration (Optional)
+
+For native stack symbolication (function names in crash reports), configure a local PDB cache:
+
+1. Copy the example config:
+   ```bash
+   copy .env.example .env
+   ```
+2. Edit `.env` and set `FIVEM_SYMBOL_CACHE` to your symbol folder path (e.g. `D:\symbolcache`).
+3. Ensure your PDBs are in the standard layout: `cache/<pdb_name>/<GUID><age>/<pdb_name>`.
 
 ## Usage
 
@@ -79,9 +95,12 @@ run_analyzer.bat
 
 The analyzer examines minidump files for:
 - **Resource Paths**: Identifies FiveM resource folders in crash stack traces
+- **Lua/JavaScript Stacks**: Extracts script stack frames and error context where present
+- **Native Symbolication**: Optional PDB cache (see Configuration) for function names in native frames
 - **Module Analysis**: Checks loaded DLLs and memory regions
 - **Native Filters**: Removes false positives from system paths
 - **Manifest Handling**: Treats fxmanifest.lua/__resource.lua as metadata only (not crash-causing scripts)
+- **Extended Data**: Handles, threads, module versions, memory regions, and process statistics for diagnostics
 
 ### Memory Leak Detection
 
@@ -145,19 +164,22 @@ The analyzer uses FiveM-specific thresholds to minimize false positives:
 
 ```
 CrashAnalyzer/
-├── analyzer.py              # Main GUI application
+├── analyzer.py              # Entry point; launches crash_analyzer GUI
 ├── crash_analyzer/
-│   ├── __init__.py
-│   ├── analyzer.py          # Legacy analyzer (kept for compatibility)
-│   ├── core.py              # Minidump parsing logic
+│   ├── __init__.py          # Package exports and version
+│   ├── analyzer.py          # PySide6 GUI (crashes + memory leaks)
+│   ├── core.py              # Minidump parsing, symbolication, crash reports
 │   ├── heap_analyzer.py     # V8 heap snapshot parser
-│   └── memory_analyzer.py   # Memory pattern analysis
+│   ├── memory_analyzer.py   # Deep analysis, script evidence, extended minidump data
+│   ├── icon.ico / icon.png  # Application icons
 ├── tests/
 │   ├── test_crash_analyzer.py
 │   ├── test_dump.py
 │   └── test_minidump_extraction.py
 ├── requirements.txt
 ├── pytest.ini
+├── run_analyzer.bat         # Windows launcher (checks Python, installs deps)
+├── .env.example             # Optional: FIVEM_SYMBOL_CACHE for PDB symbolication
 └── README.md
 ```
 
@@ -179,11 +201,12 @@ All tests should pass before committing changes.
 
 ### Code Standards
 
-- Use type hints for all function signatures
-- Follow PEP 8 style guidelines
-- Add docstrings to public methods
-- Maintain test coverage
-- Use async/await for I/O operations
+- Use Python 3.10+ type hints for all function signatures
+- Use the `minidump` library for `.dmp` files; avoid manual binary seeking where possible
+- Format addresses as hex strings (`0x{address:016X}`) for debugger compatibility
+- Wrap parsing in try/except and return structured `AnalysisError` on malformed input
+- Use context managers for file access to avoid file locks
+- Return analysis results as Pydantic models or typed dicts suitable for JSON (e.g. Discord/frontend)
 
 ## Technical Details
 
@@ -209,6 +232,18 @@ This handles complex object graphs where resources create deeply nested structur
 MIT License - feel free to use this for your FiveM server!
 
 ## Changelog
+
+### v2.1.0
+- Deep memory analysis with script/resource pinpointing
+- Lua and JavaScript stack trace extraction from crash dumps
+- Optional native stack symbolication via local PDB cache (`.env` / `FIVEM_SYMBOL_CACHE`)
+- Extended minidump data: handles, threads, module versions, memory regions, process statistics
+- FiveM-specific crash pattern detection and evidence types
+
+### v2.0.0
+- Major analysis pipeline refactor; GUI and logic moved into `crash_analyzer` package
+- Integrated memory analyzer with deep analysis and progress/abort support
+- Top-level `analyzer.py` launcher; run via `python analyzer.py` or `run_analyzer.bat`
 
 ### v1.1.0
 - Added heap timeline memory leak detection

@@ -7,6 +7,14 @@ This package provides comprehensive crash analysis for FiveM, including:
 - FiveM-specific crash pattern detection
 - Extended minidump data extraction (handles, threads, modules, memory info)
 """
+# Load .env from project root before any submodules (for FIVEM_SYMBOL_CACHE etc.)
+try:
+    from dotenv import load_dotenv 
+    import os
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    load_dotenv(os.path.join(_root, ".env"))
+except ImportError:
+    pass
 from .core import (
     CrashAnalyzer,
     CrashReport,

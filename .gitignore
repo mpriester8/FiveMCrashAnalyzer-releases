@@ -168,8 +168,8 @@ secrets/
 # Misc
 coverage/
 
-# Ensure package metadata is ignored
-*.egg-info/
+# Cursor IDE (local state and rules; .mdc rule files not committed)
+.cursor/
 
 # Keep an example env file tracked
 !.env.example

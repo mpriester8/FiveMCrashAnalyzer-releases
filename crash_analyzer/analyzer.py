@@ -16,6 +16,7 @@ class AnalysisWorker(QThread):
     """Background worker for crash analysis."""
     finished = Signal(object)  # Emits list of (filename, CrashReport) tuples
     progress = Signal(str)  # Emits status messages
+    progress_detail = Signal(str, float, str)  # stage, progress (0-1), message
     error = Signal(str)
 
     def __init__(self, analyzer, dump_files, log_files):
@@ -23,11 +24,26 @@ class AnalysisWorker(QThread):
         self.analyzer = analyzer
         self.dump_files = dump_files if dump_files else []
         self.log_files = log_files
+        self._cancel_requested = False
+        # Set up progress callback to emit signals
+        self.analyzer.set_progress_callback(self._on_progress)
+        # Abort check so long-running analysis can be cancelled
+        self.analyzer.set_abort_check(lambda: self._cancel_requested)
+
+    def request_cancel(self) -> None:
+        """Request that the current analysis stop (checked between dumps and in long loops)."""
+        self._cancel_requested = True
+
+    def _on_progress(self, stage: str, progress: float, message: str) -> None:
+        """Callback from memory analyzer - emit as signal for thread safety."""
+        self.progress_detail.emit(stage, progress, message)
+        # Also emit simplified message
+        self.progress.emit(message)
 
     def run(self):
+        import traceback
+        results = []
         try:
-            results = []
-
             if not self.dump_files:
                 # No dump files, just analyze logs
                 self.progress.emit("Analyzing log files only...")
@@ -40,6 +56,9 @@ class AnalysisWorker(QThread):
                 # Analyze each dump file
                 total = len(self.dump_files)
                 for i, dump_file in enumerate(self.dump_files, 1):
+                    if self._cancel_requested:
+                        self.progress.emit("Analysis cancelled.")
+                        break
                     filename = os.path.basename(dump_file)
                     self.progress.emit(f"Analyzing dump {i}/{total}: {filename}...")
 
@@ -49,11 +68,20 @@ class AnalysisWorker(QThread):
                     )
                     results.append((filename, report))
 
-            self.progress.emit("Analysis complete!")
+            if not self._cancel_requested:
+                self.progress.emit("Analysis complete!")
             self.finished.emit(results)
 
-        except Exception as e:
-            self.error.emit(str(e))
+        except BaseException as e:
+            # Catch all Python exceptions (including KeyboardInterrupt) so the app
+            # never "stopped working" due to an unhandled exception in the worker
+            msg = str(e)
+            tb = traceback.format_exc()
+            if tb and tb.strip() != "NoneType: None":
+                self.error.emit(f"{msg}\n\nTraceback:\n{tb}")
+            else:
+                self.error.emit(msg)
+            self.finished.emit(results)  # Emit partial results so UI can reset
 
 
 class CrashAnalyzerGUI(QWidget):
@@ -180,11 +208,18 @@ class CrashAnalyzerGUI(QWidget):
         self.analyze_btn = QPushButton('Analyze Crash (Deep Memory Dive)')
         self.analyze_btn.setStyleSheet("font-weight: bold; padding: 10px;")
         self.analyze_btn.clicked.connect(self.analyze)
-        action_layout.addWidget(self.analyze_btn)
+        action_layout.addWidget(self.analyze_btn, 1)  # stretch so buttons share space equally
+
+        self.cancel_btn = QPushButton('Cancel')
+        self.cancel_btn.setToolTip("Stop the current analysis")
+        self.cancel_btn.clicked.connect(self._on_cancel_clicked)
+        self.cancel_btn.setVisible(False)
+        action_layout.addWidget(self.cancel_btn)
 
         self.clear_btn = QPushButton('Clear All')
+        self.clear_btn.setStyleSheet("padding: 10px;")  # same padding as Analyze for equal height
         self.clear_btn.clicked.connect(self.clear_files)
-        action_layout.addWidget(self.clear_btn)
+        action_layout.addWidget(self.clear_btn, 1)  # same stretch as Analyze for equal width
         main_layout.addLayout(action_layout)
 
         # Progress bar
@@ -356,15 +391,58 @@ class CrashAnalyzerGUI(QWidget):
         )
         self.worker.finished.connect(self.on_analysis_complete)
         self.worker.progress.connect(self.on_progress)
+        self.worker.progress_detail.connect(self.on_progress_detail)
         self.worker.error.connect(self.on_error)
+        self.cancel_btn.setVisible(True)
         self.worker.start()
+
+    def _on_cancel_clicked(self):
+        """Request that the background analysis stop."""
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.worker.request_cancel()
+            self.status_label.setText("Cancelling...")
+            self.status_label.setStyleSheet("color: orange;")
 
     def on_progress(self, message):
         self.status_label.setText(message)
 
+    def on_progress_detail(self, stage: str, progress: float, message: str):
+        """Handle detailed progress updates from memory analyzer.
+        
+        Args:
+            stage: Current analysis stage (init, structure, streaming, sampling, etc.)
+            progress: Progress within stage (0.0 to 1.0)
+            message: Human-readable status message
+        """
+        # Update status label with detailed message
+        self.status_label.setText(message)
+        # Process pending events so the window repaints and stays responsive (avoids "Not Responding" on large files)
+        QApplication.processEvents()
+        
+        # Update progress bar
+        # Map stages to overall progress ranges
+        stage_ranges = {
+            'init': (0, 5),
+            'structure': (5, 15),
+            'memory': (15, 90),
+            'streaming': (15, 90),
+            'sampling': (15, 90),
+            'correlate': (90, 98),
+            'complete': (98, 100),
+        }
+        
+        if stage in stage_ranges:
+            start, end = stage_ranges[stage]
+            overall_progress = start + (end - start) * progress
+            self.progress_bar.setValue(int(overall_progress))
+
     def on_error(self, error_msg):
+        # Stop the indeterminate animation by resetting to determinate range
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         self.analyze_btn.setEnabled(True)
+        self.cancel_btn.setVisible(False)
         self.status_label.setText(f"Error: {error_msg}")
         self.status_label.setStyleSheet("color: red;")
 
@@ -372,13 +450,21 @@ class CrashAnalyzerGUI(QWidget):
         """Handle completion of analysis for one or more dump files.
 
         Args:
-            results: List of (filename, CrashReport) tuples
+            results: List of (filename, CrashReport) tuples (may be empty if cancelled)
         """
         self.current_reports = results
+        # Stop the indeterminate animation by resetting to determinate range
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
         self.progress_bar.setVisible(False)
         self.analyze_btn.setEnabled(True)
+        self.cancel_btn.setVisible(False)
 
         num_dumps = len(results)
+        if num_dumps == 0:
+            self.status_label.setText("Analysis cancelled or no results.")
+            self.status_label.setStyleSheet("color: orange;")
+            return
         self.status_label.setText(f"Analysis complete! ({num_dumps} dump{'s' if num_dumps != 1 else ''} analyzed)")
         self.status_label.setStyleSheet("color: green;")
 
@@ -547,9 +633,17 @@ class CrashAnalyzerGUI(QWidget):
             if report.primary_suspects:
                 top = report.primary_suspects[0]
                 top_info = f"  Top Suspect: {top.name} (score: {top.evidence_count})"
-                if top.scripts:
+                if getattr(top, 'likely_script', None):
+                    top_info += f" [Likely script: {top.likely_script}]"
+                elif top.scripts:
                     top_info += f" - {top.scripts[0]}"
                 summary_lines.append(top_info)
+                sec = getattr(report, 'primary_suspect_secondary', None)
+                conf = getattr(report, 'primary_suspect_confidence', 'medium')
+                if sec:
+                    summary_lines.append(f"  Also consider: {sec} (evidence ambiguous)")
+                if conf == "low":
+                    summary_lines.append("  (Confidence: low - correlate with stack traces)")
             summary_lines.append(f"  Evidence Items: {len(report.all_evidence)}")
 
         self.summary_text.setPlainText("\n".join(summary_lines))
@@ -862,6 +956,92 @@ class CrashAnalyzerGUI(QWidget):
                 lines.append(f"  Line: {report.assertion_info['line']}")
             lines.append("")
 
+        # ===== MEMORY LEAK ANALYSIS SECTION =====
+        has_leak_data = (
+            report.entity_creations or report.entity_deletions or
+            report.memory_leak_indicators or report.pool_exhaustion_indicators or
+            report.timers_created or report.nui_patterns or report.database_patterns
+        )
+        
+        if has_leak_data:
+            lines.append("-" * 40)
+            lines.append("MEMORY LEAK ANALYSIS:")
+            lines.append("")
+            
+            # Entity lifecycle analysis
+            if report.entity_creations or report.entity_deletions:
+                create_count = len(report.entity_creations)
+                delete_count = len(report.entity_deletions)
+                lines.append(f"  Entity Lifecycle:")
+                lines.append(f"    - Creation calls found: {create_count}")
+                lines.append(f"    - Deletion calls found: {delete_count}")
+                if create_count > delete_count * 2:
+                    lines.append(f"    ⚠️  WARNING: Many more creates than deletes - possible entity leak!")
+                
+                # Show most common creation types
+                if report.entity_creations:
+                    from collections import Counter
+                    creation_types = Counter(c[0] for c in report.entity_creations)
+                    lines.append(f"    Most common creations:")
+                    for native, count in creation_types.most_common(5):
+                        lines.append(f"      - {native}: {count} times")
+                lines.append("")
+            
+            # Memory leak indicators
+            if report.memory_leak_indicators:
+                lines.append(f"  ⚠️  Memory Leak Indicators Found: {len(report.memory_leak_indicators)}")
+                from collections import Counter
+                indicator_types = Counter(i[1] for i in report.memory_leak_indicators)
+                for itype, count in indicator_types.most_common(5):
+                    lines.append(f"    - {itype}: {count} occurrences")
+                lines.append("")
+            
+            # Pool exhaustion
+            if report.pool_exhaustion_indicators:
+                lines.append(f"  🚨 POOL EXHAUSTION DETECTED: {len(report.pool_exhaustion_indicators)}")
+                for msg, _ in report.pool_exhaustion_indicators[:5]:
+                    lines.append(f"    - {msg[:60]}")
+                lines.append("")
+            
+            # Timers
+            if report.timers_created:
+                lines.append(f"  Timer Patterns: {len(report.timers_created)} found")
+                lines.append(f"    (Check that timers are cleaned up on resource stop)")
+                lines.append("")
+            
+            # NUI/CEF patterns
+            if report.nui_patterns:
+                lines.append(f"  NUI/CEF Patterns: {len(report.nui_patterns)} found")
+                lines.append(f"    (Check for NUI memory leaks, unclosed browsers)")
+                lines.append("")
+            
+            # Database patterns
+            if report.database_patterns:
+                lines.append(f"  Database Queries: {len(report.database_patterns)} found")
+                lines.append(f"    (Check for unclosed connections, slow queries)")
+                lines.append("")
+            
+            # Event handlers
+            if report.event_handlers_registered:
+                reg_count = len(report.event_handlers_registered)
+                rem_count = len(report.event_handlers_removed)
+                lines.append(f"  Event Handlers:")
+                lines.append(f"    - Registered: {reg_count}")
+                lines.append(f"    - Removed: {rem_count}")
+                if reg_count > rem_count * 3:
+                    lines.append(f"    ⚠️  Many handlers registered but few removed")
+                lines.append("")
+            
+            # Network patterns
+            if report.network_patterns:
+                lines.append(f"  Network Sync Calls: {len(report.network_patterns)} found")
+                lines.append("")
+            
+            # State bags
+            if report.statebag_patterns:
+                lines.append(f"  State Bag Operations: {len(report.statebag_patterns)} found")
+                lines.append("")
+
         if report.analysis_errors:
             lines.append("-" * 40)
             lines.append("ANALYSIS NOTES:")
@@ -883,9 +1063,19 @@ class CrashAnalyzerGUI(QWidget):
             lines.append("Check the Stack Traces and Script Errors tabs for more info.")
             return "\n".join(lines)
 
+        sec = getattr(report, 'primary_suspect_secondary', None)
+        conf = getattr(report, 'primary_suspect_confidence', 'medium')
+        if sec:
+            lines.append("Note: Top two suspects have close scores; consider both.")
+        if conf == "low":
+            lines.append("Confidence is low; correlate with stack traces and script errors.")
+        lines.append("")
+
         for i, suspect in enumerate(report.primary_suspects[:10], 1):
             lines.append(f"#{i} ========================================")
             lines.append(f"   RESOURCE: {suspect.name}")
+            if getattr(suspect, 'likely_script', None):
+                lines.append(f"   Likely script: {suspect.likely_script}")
             lines.append(f"   Evidence Score: {suspect.evidence_count}")
             lines.append("")
             lines.append(f"   Evidence Types:")
@@ -977,40 +1167,87 @@ class CrashAnalyzerGUI(QWidget):
                 lines.append(f"  ... and {len(report.threads_extended) - 30} more threads")
             lines.append("")
 
-        # Lua stacks
+        # Lua stacks (with resources involved per stack)
         if report.lua_stacks:
             lines.append("LUA STACK TRACES:")
             lines.append("-" * 40)
             for i, stack in enumerate(report.lua_stacks, 1):
                 lines.append(f"\nStack #{i}:")
+                if i - 1 < len(report.lua_stack_resources) and report.lua_stack_resources[i - 1]:
+                    lines.append(f"  Resources involved: {', '.join(report.lua_stack_resources[i - 1])}")
                 for frame in stack:
                     c_marker = " [C]" if frame.is_c_function else ""
                     func = frame.function_name or "(anonymous)"
                     lines.append(f"  {frame.source}:{frame.line}: in {func}{c_marker}")
             lines.append("")
 
-        # JS stacks
+        # JS stacks (with resources involved per stack)
         if report.js_stacks:
             lines.append("JAVASCRIPT STACK TRACES:")
             lines.append("-" * 40)
-            for trace in report.js_stacks:
+            for i, trace in enumerate(report.js_stacks):
+                if i < len(report.js_stack_resources) and report.js_stack_resources[i]:
+                    lines.append(f"  Resources involved: {', '.join(report.js_stack_resources[i])}")
                 lines.append(f"  {trace}")
             lines.append("")
 
-        # Native stacks
+        # Native stacks (symbolicated when PDBs available)
         if report.native_stacks:
             lines.append("NATIVE STACK TRACE (Crashing Thread):")
             lines.append("-" * 40)
-            for frame in report.native_stacks:
-                lines.append(f"  {frame}")
+            # Show resource names right here so user can correlate
+            resources_for_stack = []
+            if report.primary_suspects:
+                resources_for_stack = [s.name for s in report.primary_suspects[:10]]
+            elif getattr(report, 'resources', None):
+                by_ev = sorted(
+                    report.resources.items(),
+                    key=lambda x: (getattr(x[1], 'evidence_count', 0), x[0]),
+                    reverse=True
+                )
+                resources_for_stack = [name for name, _ in by_ev[:10]]
+            if resources_for_stack:
+                lines.append("Resources identified in this dump (correlate with stack below):")
+                lines.append("  " + ", ".join(resources_for_stack))
+                lines.append("")
+            lines.append("How to use this to find the cause:")
+            lines.append("  - Top frames are closest to the crash; exception address = faulting instruction.")
+            lines.append("  - With PDBs, frames show:  module + 0xOFFSET  ->  function_name + 0xdisp")
+            lines.append("  - Correlate the resources above with the stack to see which script triggered this path.")
+            lines.append("")
+            sym = getattr(report, 'native_stacks_symbolicated', None)
+            has_symbolication = sym and any("  ->  " in f for f in sym)
+            if not has_symbolication and report.native_stacks:
+                if getattr(report, 'module_versions', None):
+                    if getattr(report, 'symbolication_had_local_path', False):
+                        lines.append("  (Symbols not loaded: PDB not found on FiveM symbol server or in local cache. Ensure FIVEM_SYMBOL_CACHE folder has PDBs for this build (e.g. <pdb_name>/<GUID><age>/<pdb_name>). Showing module+offset only.)")
+                        diag = getattr(report, 'symbolication_diagnostic', None)
+                        if diag:
+                            lines.append("")
+                            lines.append(diag)
+                    else:
+                        lines.append("  (Symbols not loaded: PDB not found on FiveM symbol server (404). To use local PDBs, set FIVEM_SYMBOL_CACHE in .env to your symbol folder (e.g. D:\\symbolcache). Showing module+offset only.)")
+                else:
+                    lines.append("  (Symbols not loaded: PDB download failed or module info missing. Showing module+offset only.)")
+                lines.append("")
+            elif has_symbolication:
+                lines.append("  (Symbols loaded from server or local cache; correlate the function names below with the resources list to identify the crashing resource.)")
+                lines.append("")
+            display_frames = sym if (sym and len(sym) == len(report.native_stacks)) else report.native_stacks
+            for frame in display_frames:
+                lines.append(frame if (frame and frame.startswith("  ")) else f"  {frame}")
             lines.append("")
 
         if not report.lua_stacks and not report.js_stacks and not report.native_stacks and not report.threads_extended:
             lines.append("No stack traces could be recovered from the dump.")
             lines.append("")
-            lines.append("This might happen if:")
-            lines.append("  - The crash was in native code (not a script)")
-            lines.append("  - The dump doesn't contain stack memory")
+            lines.append("Check ANALYSIS NOTES/WARNINGS below for the stack recovery diagnostic.")
+            lines.append("It will state whether the dump contains stack memory or not (analysis error vs. dump content).")
+            lines.append("")
+            lines.append("Common causes when dump has stack memory:")
+            lines.append("  - Extraction fallback may have run; re-run analysis to get native stack")
+            lines.append("Common causes when dump lacks stack memory:")
+            lines.append("  - The dump doesn't include thread/stack descriptors")
             lines.append("  - The script runtime state was corrupted")
 
         return "\n".join(lines)
