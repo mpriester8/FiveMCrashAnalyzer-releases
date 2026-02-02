@@ -735,6 +735,49 @@ class MemoryAnalyzer:
         'c', 'd', 'e', 'f', 'x',
     }
 
+    # Common word fragments that appear in corrupted memory but are NOT valid resource names.
+    # These are typically suffixes/fragments of English words like "errors", "resources", etc.
+    # that get extracted when binary memory contains partial or corrupted strings.
+    WORD_FRAGMENTS = {
+        # Fragments from common crash-dump terminology
+        'rors', 'rror', 'rrors', 'error',  # from "errors"
+        'ource', 'ources', 'esource',  # from "resource(s)"
+        'ript', 'cript', 'cripts',  # from "script(s)"
+        'lient', 'lients',  # from "client(s)"
+        'erver', 'ervers',  # from "server(s)"
+        'unction', 'nction', 'unctions',  # from "function(s)"
+        'xception', 'ception',  # from "exception"
+        'tring', 'trings',  # from "string(s)"
+        'alue', 'alues',  # from "value(s)"
+        'ndex', 'ndexes', 'ndices',  # from "index/indices"
+        'ttach', 'ttached',  # from "attach(ed)"
+        'emory', 'mory',  # from "memory"
+        'uffer', 'uffers',  # from "buffer(s)"
+        'nable', 'nabled',  # from "enable(d)"
+        'isable', 'isabled',  # from "disable(d)"
+        'elete', 'eleted',  # from "delete(d)"
+        'reate', 'reated',  # from "create(d)"
+        'pdate', 'pdated',  # from "update(d)"
+        'vent', 'vents',  # from "event(s)"
+        'hread', 'hreads',  # from "thread(s)"
+        'rocess', 'rocesses',  # from "process(es)"
+        'andler', 'andlers',  # from "handler(s)"
+        'allback', 'allbacks',  # from "callback(s)"
+        'odule', 'odules',  # from "module(s)"
+        'ystem', 'ystems',  # from "system(s)"
+        'bject', 'bjects',  # from "object(s)"
+        'rray', 'rrays',  # from "array(s)"
+        'umber', 'umbers',  # from "number(s)"
+        'oolean',  # from "boolean"
+        'tatus',  # from "status"
+        'esult', 'esults',  # from "result(s)"
+        'nable',  # from "unable"
+        'nvalid',  # from "invalid"
+        'efault',  # from "default"
+        'onfig', 'onfigs',  # from "config(s)"
+        'etting', 'ettings',  # from "setting(s)"
+    }
+
     # CitizenFX Script Runtime markers
     CITIZENFX_RUNTIME_MARKERS = [
         b'citizen-scripting-lua',
@@ -910,6 +953,37 @@ class MemoryAnalyzer:
     # Process at least this many chunks (first 1GB at 64MB/chunk) before allowing early stop
     MIN_STREAMING_CHUNKS_BEFORE_EARLY_STOP = 16
 
+    # Symbol server configuration for FiveM and Microsoft symbols
+    SYMBOL_CACHE_PATH = r"D:\symbolcache"
+    SYMBOL_SERVERS = [
+        "https://symbol-server.fivem.net/",
+        "https://msdl.microsoft.com/download/symbols",
+    ]
+
+    def _configure_symbol_path(self) -> None:
+        """Configure the _NT_SYMBOL_PATH environment variable for symbol resolution.
+        
+        Sets up symbol servers for FiveM and Microsoft symbols with local caching.
+        This enables proper stack trace resolution when analyzing crash dumps.
+        
+        Format: Each server needs its own srv* entry separated by semicolons:
+        srv*<cache>*<server1>;srv*<cache>*<server2>
+        """
+        # Build symbol path: srv*<cache>*<server1>;srv*<cache>*<server2>
+        # Each symbol server needs its own srv* prefix for WinDbg to recognize it
+        srv_entries = [f"srv*{self.SYMBOL_CACHE_PATH}*{server}" for server in self.SYMBOL_SERVERS]
+        symbol_path = ";".join(srv_entries)
+        
+        # Set environment variable for current process and any child processes
+        os.environ["_NT_SYMBOL_PATH"] = symbol_path
+        
+        # Ensure symbol cache directory exists
+        try:
+            os.makedirs(self.SYMBOL_CACHE_PATH, exist_ok=True)
+        except OSError:
+            # If we can't create the cache dir, still set the path - symstore may create it
+            pass
+
     def analyze_dump_deep(self, dump_path: str) -> DeepAnalysisResult:
         """Perform deep analysis of a minidump file to pinpoint error sources.
         
@@ -923,6 +997,9 @@ class MemoryAnalyzer:
         
         Progress is reported via the callback provided in __init__.
         """
+        # Configure symbol servers for FiveM and Microsoft symbols
+        self._configure_symbol_path()
+        
         self.result = DeepAnalysisResult()
         self._evidence_seen: Set[str] = set()  # Deduplication cache
         self._max_evidence = self.MAX_EVIDENCE_ITEMS
@@ -1949,21 +2026,28 @@ class MemoryAnalyzer:
 
     def _analyze_raw_memory(self, data: bytes) -> None:
         """Analyze raw memory dump for strings and patterns."""
-        # Extract all printable strings
+        # Extract all printable strings (now returns tuples of string, offset, confidence)
         strings = self._extract_strings_advanced(data)
 
         # Populate raw_strings for pattern matching in full_analysis (avoids re-reading dump)
+        # Filter out low-confidence strings (likely word fragments)
         max_raw_strings = getattr(self, '_max_raw_strings', 3000)
         seen_raw: Set[str] = set()
-        for s, _ in strings:
+        for s, _, confidence in strings:
+            # Skip very low confidence strings (likely corrupted fragments)
+            if confidence < 0.3:
+                continue
             if s not in seen_raw and len(self.result.raw_strings) < max_raw_strings:
                 seen_raw.add(s)
                 self.result.raw_strings.append(s)
             if len(self.result.raw_strings) >= max_raw_strings:
                 break
 
-        # Categorize strings
-        for s, offset in strings:
+        # Categorize strings - use confidence to weight evidence
+        for s, offset, confidence in strings:
+            # Skip very low confidence strings
+            if confidence < 0.2:
+                continue
             lower = s.lower()
 
             # Check for script paths - capture FULL path before .lua/.js
@@ -1979,13 +2063,15 @@ class MemoryAnalyzer:
                     # Extract resource from full path
                     resource = self._extract_resource_from_path(full_path)
 
+                    # Combine base confidence (0.7) with string extraction confidence
+                    evidence_confidence = min(0.7 * confidence, 0.95)
                     self._add_evidence(ScriptEvidence(
                         evidence_type=EvidenceType.SCRIPT_PATH,
                         script_name=script_name,
                         resource_name=resource,  # May be None, that's OK
                         file_path=full_path,
                         memory_address=offset,
-                        confidence=0.7
+                        confidence=evidence_confidence
                     ))
 
             if '.js' in lower:
@@ -1998,32 +2084,40 @@ class MemoryAnalyzer:
 
                     resource = self._extract_resource_from_path(full_path)
 
+                    # Combine base confidence (0.7) with string extraction confidence
+                    evidence_confidence = min(0.7 * confidence, 0.95)
                     self._add_evidence(ScriptEvidence(
                         evidence_type=EvidenceType.SCRIPT_PATH,
                         script_name=script_name,
                         resource_name=resource,
                         file_path=full_path,
                         memory_address=offset,
-                        confidence=0.7
+                        confidence=evidence_confidence
                     ))
 
             # Check for resource references
             if 'resource' in lower or 'fxmanifest' in lower:
                 res_match = re.search(r'([A-Za-z0-9_\-]{2,64})[/\\]fxmanifest', s, re.I)
                 if res_match:
+                    # Combine base confidence (0.6) with string extraction confidence
+                    evidence_confidence = min(0.6 * confidence, 0.95)
                     self._add_evidence(ScriptEvidence(
                         evidence_type=EvidenceType.MANIFEST_REFERENCE,
                         script_name='fxmanifest.lua',
                         resource_name=res_match.group(1),
                         memory_address=offset,
-                        confidence=0.6
+                        confidence=evidence_confidence
                     ))
 
-    def _extract_strings_advanced(self, data: bytes, min_length: int = 4) -> List[Tuple[str, int]]:
-        """Extract strings with their memory offsets.
+    def _extract_strings_advanced(self, data: bytes, min_length: int = 4) -> List[Tuple[str, int, float]]:
+        """Extract strings with their memory offsets and confidence scores.
         
         Optimized with memoryview to avoid copying data and chunked processing
-        for large dumps.
+        for large dumps. Returns tuples of (string, offset, confidence) where
+        confidence is based on proper string boundary detection (null terminators).
+        
+        Properly bounded strings (preceded and followed by null or non-printable bytes)
+        receive higher confidence scores, while fragments receive lower scores.
         """
         results = []
         data_view = memoryview(data)
@@ -2040,11 +2134,23 @@ class MemoryAnalyzer:
                 current_chars.append(chr(b))
             else:
                 if len(current_chars) >= min_length:
-                    results.append((''.join(current_chars), start_offset))
+                    string = ''.join(current_chars)
+                    # Calculate confidence based on string boundaries
+                    confidence = self._calculate_string_confidence(
+                        data_view, start_offset, i, data_len, string
+                    )
+                    results.append((string, start_offset, confidence))
                 current_chars = []
 
         if len(current_chars) >= min_length:
-            results.append((''.join(current_chars), start_offset))
+            string = ''.join(current_chars)
+            # End of data - check start boundary only
+            has_proper_start = (start_offset == 0 or data_view[start_offset - 1] == 0 or data_view[start_offset - 1] < 32)
+            confidence = 1.0 if has_proper_start else 0.5
+            # Apply word fragment penalty
+            if string.lower() in self.WORD_FRAGMENTS:
+                confidence *= 0.1
+            results.append((string, start_offset, confidence))
 
         # UTF-16 strings (common in Windows) - only process if dump is reasonable size
         # Skip UTF-16 extraction for very large dumps (> 100MB) to save time
@@ -2060,13 +2166,50 @@ class MemoryAnalyzer:
                             chars.append(chr(data_view[i]))
                             i += 2
                         if len(chars) >= min_length:
-                            results.append((''.join(chars), start))
+                            string = ''.join(chars)
+                            # UTF-16 strings are typically properly encoded, give them decent confidence
+                            # but still check for word fragments
+                            confidence = 0.8
+                            if string.lower() in self.WORD_FRAGMENTS:
+                                confidence *= 0.1
+                            results.append((string, start, confidence))
                     else:
                         i += 1
             except Exception:
                 pass
 
         return results
+
+    def _calculate_string_confidence(self, data_view: memoryview, start: int, end: int, data_len: int, string: str) -> float:
+        """Calculate confidence score for an extracted string based on memory boundaries.
+        
+        Higher confidence is given to strings that are properly null-terminated
+        or bounded by non-printable characters (indicating proper string boundaries).
+        Lower confidence for strings that may be fragments of corrupted memory.
+        """
+        # Check if string has proper start boundary (null or non-printable byte before)
+        has_proper_start = (start == 0 or data_view[start - 1] == 0 or data_view[start - 1] < 32)
+        
+        # Check if string has proper end boundary (null or non-printable byte after)
+        has_proper_end = (end >= data_len or data_view[end] == 0 or data_view[end] < 32)
+        
+        # Base confidence scoring
+        if has_proper_start and has_proper_end:
+            confidence = 1.0  # Properly bounded string
+        elif has_proper_start or has_proper_end:
+            confidence = 0.7  # Partially bounded
+        else:
+            confidence = 0.4  # No clear boundaries - likely a fragment
+        
+        # Penalize known word fragments heavily
+        if string.lower() in self.WORD_FRAGMENTS:
+            confidence *= 0.1  # 90% penalty for known fragments
+        
+        # Short strings (< 5 chars) without proper boundaries get extra penalty
+        if len(string) < 5 and not (has_proper_start and has_proper_end):
+            confidence *= 0.5
+        
+        return confidence
 
     def _extract_lua_stacks(self, data: bytes) -> None:
         """Extract Lua stack traces from memory."""
@@ -2809,6 +2952,9 @@ class MemoryAnalyzer:
         # Check against ignored path segments
         if name_lower in self.IGNORED_PATH_SEGMENTS:
             return False
+        # Reject known word fragments from corrupted memory (e.g., "rors" from "errors")
+        if name_lower in self.WORD_FRAGMENTS:
+            return False
         # Manifest files are metadata, not resources - reject them as resource names
         if name_lower in self.MANIFEST_FILES:
             return False
@@ -3296,6 +3442,148 @@ class MemoryAnalyzer:
             if base <= address < end:
                 return (name, base)
         return None
+
+    def lookup_address(self, address: int) -> Dict[str, any]:
+        """Look up detailed information about what's at a specific memory address.
+        
+        Args:
+            address: The memory address to look up (can be int or hex string like "0x12345678")
+            
+        Returns:
+            Dictionary with address information:
+            - address: The queried address (int)
+            - module: Module name if address is in a loaded module
+            - module_base: Base address of the module
+            - module_offset: Offset from module base
+            - region: Memory region information (protection, state, type)
+            - contains_data: Whether we have memory data at this address
+            - nearby_resources: Resources with evidence near this address
+            - description: Human-readable description
+        """
+        # Convert hex string to int if needed
+        if isinstance(address, str):
+            address = int(address, 16)
+        
+        result = {
+            "address": address,
+            "address_hex": f"0x{address:016X}",
+            "module": None,
+            "module_base": None,
+            "module_offset": None,
+            "region": None,
+            "contains_data": False,
+            "nearby_resources": [],
+            "description": "Unknown memory address"
+        }
+        
+        # Check if address is in a loaded module
+        module_info = self._get_module_info_for_address(address)
+        if module_info:
+            module_name, module_base = module_info
+            result["module"] = module_name
+            result["module_base"] = module_base
+            result["module_base_hex"] = f"0x{module_base:016X}"
+            result["module_offset"] = address - module_base
+            result["module_offset_hex"] = f"0x{result['module_offset']:X}"
+            result["description"] = f"{module_name}+0x{result['module_offset']:X}"
+        
+        # Find memory region containing this address
+        for region in self.result.memory_info:
+            if region.start_address <= address < region.start_address + region.size:
+                result["region"] = {
+                    "start": region.start_address,
+                    "start_hex": f"0x{region.start_address:016X}",
+                    "size": region.size,
+                    "protection": region.protection,
+                    "state": region.state,
+                    "type": region.type_str,
+                    "module": region.module_name,
+                    "contains_code": region.contains_code
+                }
+                if not result["description"] or result["description"] == "Unknown memory address":
+                    result["description"] = f"Memory region at 0x{region.start_address:016X} ({region.protection})"
+                break
+        
+        # Check if we have actual memory data at this address
+        for mem_start, mem_data in self._memory_data.items():
+            mem_end = mem_start + len(mem_data)
+            if mem_start <= address < mem_end:
+                result["contains_data"] = True
+                offset = address - mem_start
+                # Extract a small sample of the data
+                sample_size = min(32, len(mem_data) - offset)
+                if sample_size > 0:
+                    data_sample = mem_data[offset:offset + sample_size]
+                    result["data_sample"] = data_sample.hex()
+                    result["data_sample_ascii"] = ''.join(
+                        chr(b) if 32 <= b <= 126 else '.' for b in data_sample
+                    )
+                break
+        
+        # Find evidence near this address (within 4KB)
+        nearby_threshold = 4096
+        nearby_evidence = []
+        for evidence in self.result.all_evidence:
+            if evidence.memory_address:
+                if abs(evidence.memory_address - address) <= nearby_threshold:
+                    if evidence.resource_name and evidence.resource_name not in nearby_evidence:
+                        nearby_evidence.append(evidence.resource_name)
+        
+        result["nearby_resources"] = nearby_evidence[:5]  # Top 5
+        
+        return result
+
+    def format_address_lookup(self, address: int) -> str:
+        """Format address lookup information as a human-readable string."""
+        info = self.lookup_address(address)
+        
+        lines = []
+        lines.append("=" * 70)
+        lines.append(f"MEMORY ADDRESS LOOKUP: {info['address_hex']}")
+        lines.append("=" * 70)
+        lines.append("")
+        
+        lines.append(f"Description: {info['description']}")
+        lines.append("")
+        
+        if info['module']:
+            lines.append("MODULE INFORMATION:")
+            lines.append(f"  Name: {info['module']}")
+            lines.append(f"  Base: {info['module_base_hex']}")
+            lines.append(f"  Offset: {info['module_offset_hex']} (+{info['module_offset']:,} bytes)")
+            lines.append("")
+        
+        if info['region']:
+            reg = info['region']
+            lines.append("MEMORY REGION:")
+            lines.append(f"  Range: {reg['start_hex']} - 0x{reg['start'] + reg['size']:016X}")
+            lines.append(f"  Size: {reg['size']:,} bytes")
+            lines.append(f"  Protection: {reg['protection']}")
+            lines.append(f"  State: {reg['state']}")
+            lines.append(f"  Type: {reg['type']}")
+            if reg['module']:
+                lines.append(f"  Module: {reg['module']}")
+            if reg['contains_code']:
+                lines.append("  Contains executable code")
+            lines.append("")
+        
+        if info['contains_data']:
+            lines.append("MEMORY DATA AT ADDRESS:")
+            if 'data_sample' in info:
+                lines.append(f"  Hex: {info['data_sample']}")
+                lines.append(f"  ASCII: {info['data_sample_ascii']}")
+            else:
+                lines.append("  (Data available)")
+            lines.append("")
+        
+        if info['nearby_resources']:
+            lines.append("NEARBY RESOURCES (within 4KB):")
+            for res in info['nearby_resources']:
+                lines.append(f"  • {res}")
+            lines.append("")
+        
+        lines.append("=" * 70)
+        return "\n".join(lines)
 
     # Minidump stream type constants (minidumpapiset.h)
     _THREAD_LIST_STREAM = 3
@@ -4391,6 +4679,78 @@ class MemoryAnalyzer:
         lines.append("=" * 60)
         return "\n".join(lines)
 
+    def _generate_resource_activity_summary(self, resource_name: str, info: ResourceInfo) -> List[str]:
+        """Generate a detailed activity summary for a resource showing what it was doing at crash time."""
+        lines = []
+        
+        # Get all evidence for this resource
+        resource_evidence = [e for e in self.result.all_evidence if e.resource_name == resource_name]
+        
+        if not resource_evidence:
+            return ["     (No detailed activity information available)"]
+        
+        # Group evidence by type
+        by_type = {}
+        for evidence in resource_evidence:
+            typ = evidence.evidence_type
+            if typ not in by_type:
+                by_type[typ] = []
+            by_type[typ].append(evidence)
+        
+        activities = []
+        
+        # 1. Active functions/stack traces (most important)
+        stack_evidence = by_type.get(EvidenceType.LUA_STACK_TRACE, []) + by_type.get(EvidenceType.JS_STACK_TRACE, [])
+        if stack_evidence:
+            for evidence in stack_evidence[:2]:  # Top 2 stack entries
+                func = evidence.function_name or "(anonymous)"
+                script = evidence.script_name or "unknown"
+                line = f":{evidence.line_number}" if evidence.line_number else ""
+                activities.append(f"     ├─ EXECUTING: {script}{line} in '{func}'")
+        
+        # 2. Errors encountered
+        error_evidence = by_type.get(EvidenceType.ERROR_MESSAGE, [])
+        if error_evidence:
+            for evidence in error_evidence[:2]:  # Top 2 errors
+                error_msg = evidence.context[:80] if evidence.context else "Unknown error"
+                activities.append(f"     ├─ ERROR: {error_msg}")
+        
+        # 3. Native calls being made
+        native_evidence = by_type.get(EvidenceType.NATIVE_CALL, [])
+        if native_evidence:
+            natives = []
+            for e in native_evidence:
+                if e.context and e.context not in natives:
+                    natives.append(e.context)
+                if len(natives) >= 3:
+                    break
+            if natives:
+                activities.append(f"     ├─ NATIVE CALLS: {', '.join(natives)}")
+        
+        # 4. Event handlers
+        event_evidence = by_type.get(EvidenceType.EVENT_HANDLER, [])
+        if event_evidence:
+            events = []
+            for e in event_evidence:
+                event_name = e.context or e.script_name
+                if event_name and event_name not in events:
+                    events.append(event_name)
+                if len(events) >= 3:
+                    break
+            if events:
+                activities.append(f"     ├─ EVENTS: {', '.join(events)}")
+        
+        # 5. Scripts involved (last item, use └─ instead of ├─)
+        if info.scripts:
+            script_list = ', '.join(info.scripts[:5])
+            if len(info.scripts) > 5:
+                script_list += f" (+{len(info.scripts) - 5} more)"
+            activities.append(f"     └─ SCRIPTS: {script_list}")
+        elif activities:  # If we have other activities but no scripts, change last ├─ to └─
+            activities[-1] = activities[-1].replace("├─", "└─")
+        
+        return activities if activities else ["     (Activity details not captured)"]
+
     def generate_pinpoint_report(self) -> str:
         """Generate a detailed report pinpointing error sources."""
         lines = []
@@ -4411,18 +4771,29 @@ class MemoryAnalyzer:
                 lines.append(f"  Faulting Module: {self.result.exception_module}")
             lines.append("")
 
-        # Primary suspects
+        # Primary suspects with enhanced activity display
         if self.result.primary_suspects:
             lines.append("PRIMARY SUSPECTS (Most Likely Causes):")
-            lines.append("-" * 40)
+            lines.append("═" * 70)
             for i, suspect in enumerate(self.result.primary_suspects[:5], 1):
                 lines.append(f"\n  {i}. RESOURCE: {suspect.name}")
-                lines.append(f"     Evidence Count: {suspect.evidence_count}")
-                lines.append(f"     Evidence Types: {', '.join(e.name for e in suspect.evidence_types)}")
-                if suspect.scripts:
-                    lines.append(f"     Scripts: {', '.join(suspect.scripts[:5])}")
+                lines.append(f"     Evidence: {suspect.evidence_count} items ({', '.join(sorted(set(e.name.lower().replace('_', ' ') for e in suspect.evidence_types))[:4])})")
+                
+                # Add activity summary
+                lines.append("")
+                lines.append("     ⚡ ACTIVITY AT CRASH TIME:")
+                activity_lines = self._generate_resource_activity_summary(suspect.name, suspect)
+                lines.extend(activity_lines)
+                
+                # Add path if available
                 if suspect.path:
-                    lines.append(f"     Path: {suspect.path}")
+                    lines.append(f"\n     📁 Path: {suspect.path}")
+                
+                # Add separator between suspects
+                if i < len(self.result.primary_suspects[:5]):
+                    lines.append("")
+                    lines.append("     " + "─" * 60)
+            lines.append("")
             lines.append("")
 
         # All resources mentioned (FiveM relevance - resources that could be involved)

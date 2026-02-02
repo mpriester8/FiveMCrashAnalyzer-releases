@@ -128,16 +128,56 @@ def test_memory_analyzer_init():
 
 
 def test_memory_analyzer_extract_strings_advanced():
-    """Test advanced string extraction with offsets."""
+    """Test advanced string extraction with offsets and confidence scores."""
     ma = MemoryAnalyzer()
     data = b"\x00\x00myresource/client.lua\x00\x00another/script.js\x00"
     strings = ma._extract_strings_advanced(data, min_length=4)
 
-    # Should return tuples of (string, offset)
+    # Should return tuples of (string, offset, confidence)
     assert len(strings) > 0
     string_values = [s[0] for s in strings]
     assert any('myresource' in s for s in string_values)
     assert any('client.lua' in s for s in string_values)
+    # Properly null-terminated strings should have high confidence
+    for s, offset, confidence in strings:
+        assert 0.0 <= confidence <= 1.0
+
+
+def test_word_fragment_filtering():
+    """Test that word fragments like 'rors' are filtered out or penalized."""
+    ma = MemoryAnalyzer()
+    
+    # Test that word fragments are in the blocklist
+    assert 'rors' in ma.WORD_FRAGMENTS
+    assert 'rror' in ma.WORD_FRAGMENTS
+    assert 'ource' in ma.WORD_FRAGMENTS
+    
+    # Test that _is_valid_resource_name rejects word fragments
+    assert not ma._is_valid_resource_name('rors')
+    assert not ma._is_valid_resource_name('rror')
+    assert not ma._is_valid_resource_name('ource')
+    
+    # Test that valid resource names still pass
+    assert ma._is_valid_resource_name('qb-core')
+    assert ma._is_valid_resource_name('oxmysql')
+    assert ma._is_valid_resource_name('es_extended')
+    
+    # Test that string extraction penalizes word fragments
+    data = b"\x00\x00rors\x00\x00myresource\x00\x00"
+    strings = ma._extract_strings_advanced(data, min_length=4)
+    
+    # Find the 'rors' and 'myresource' strings
+    rors_confidence = None
+    myresource_confidence = None
+    for s, offset, confidence in strings:
+        if s == 'rors':
+            rors_confidence = confidence
+        if s == 'myresource':
+            myresource_confidence = confidence
+    
+    # 'rors' should have much lower confidence than 'myresource'
+    if rors_confidence is not None and myresource_confidence is not None:
+        assert rors_confidence < myresource_confidence
 
 
 def test_memory_analyzer_lua_stack_extraction():

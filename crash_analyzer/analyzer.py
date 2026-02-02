@@ -1150,14 +1150,227 @@ class CrashAnalyzerGUI(QWidget):
         lines.append("=" * 60)
         lines.append("")
 
+        # Exception information (show at the top for visibility)
+        if report.exception_code or report.exception_params:
+            lines.append("EXCEPTION INFORMATION:")
+            lines.append("-" * 40)
+            
+            # Show exception code and name
+            if report.exception_params:
+                exc_code = report.exception_params.code
+                exc_name = report.exception_params.code_name
+                lines.append(f"Exception Code: 0x{exc_code:08X} ({exc_name})")
+                
+                # Show exception address with enhanced information
+                if report.exception_params.address:
+                    exc_addr = report.exception_params.address
+                    lines.append(f"Exception Address: 0x{exc_addr:016X}")
+                    
+                    # Calculate offset from module base
+                    module_offset = None
+                    module_base = None
+                    if report.exception_module:
+                        lines.append(f"Faulting Module: {report.exception_module}")
+                        
+                        # Find the module base address from module list
+                        if report.module_versions:
+                            for mod in report.module_versions:
+                                if mod.name.lower() == report.exception_module.lower():
+                                    module_base = mod.base_address
+                                    module_offset = exc_addr - module_base
+                                    break
+                        elif report.modules:
+                            for mod in report.modules:
+                                mod_name = mod.get('name', '')
+                                if mod_name.lower() == report.exception_module.lower():
+                                    module_base = mod.get('base', 0) or mod.get('baseaddress', 0)
+                                    if module_base:
+                                        module_offset = exc_addr - module_base
+                                    break
+                        
+                        # Show module+offset format (standard for crash analysis)
+                        if module_offset is not None:
+                            lines.append(f"Module Offset: {report.exception_module} + 0x{module_offset:X}")
+                    
+                    # Check if this address appears in the symbolicated stack trace
+                    if report.native_stacks_symbolicated:
+                        exc_addr_hex = f"0x{exc_addr:X}".upper()
+                        for frame in report.native_stacks_symbolicated:
+                            if exc_addr_hex in frame.upper() or f"+0x{module_offset:X}" in frame.upper() if module_offset else False:
+                                # Extract function name if present
+                                if "  ->  " in frame:
+                                    _, func_part = frame.split("  ->  ", 1)
+                                    lines.append(f"Exception Location: {func_part.strip()}")
+                                break
+                    
+                    # If not in symbolicated trace, check raw stack trace for context
+                    elif report.native_stacks and module_offset is not None:
+                        offset_str = f"0x{module_offset:X}"
+                        for i, frame in enumerate(report.native_stacks):
+                            if offset_str in frame:
+                                stack_position = "top of stack" if i == 0 else f"frame #{i}"
+                                lines.append(f"Stack Position: Found at {stack_position} (likely the faulting instruction)")
+                                break
+                    
+                    # Provide interpretation based on offset patterns
+                    if module_offset is not None:
+                        lines.append("")
+                        lines.append("What this means:")
+                        # Check if it's in common sections
+                        if module_offset < 0x1000:
+                            lines.append("  -> Exception in module headers/low memory (unusual, possible corruption)")
+                        elif 0x1000 <= module_offset < 0x100000:
+                            lines.append("  -> Exception in early code section (startup/initialization code)")
+                        else:
+                            lines.append("  -> Exception in runtime code")
+                            # Check correlation with resources
+                            if report.primary_suspects:
+                                lines.append(f"  -> Likely triggered by: {', '.join(s.name for s in report.primary_suspects[:3])}")
+                            elif report.resources:
+                                top_resources = sorted(
+                                    report.resources.items(),
+                                    key=lambda x: getattr(x[1], 'evidence_count', 0),
+                                    reverse=True
+                                )[:3]
+                                if top_resources:
+                                    lines.append(f"  -> Likely triggered by: {', '.join(r[0] for r in top_resources)}")
+                
+                # For Access Violations, show detailed information
+                if exc_code == 0xC0000005 and report.exception_params.access_type:
+                    lines.append(f"Access Type: {report.exception_params.access_type}")
+                    if report.exception_params.target_address is not None:
+                        lines.append(f"Target Address: 0x{report.exception_params.target_address:016X}")
+                        # Categorize the target address
+                        target = report.exception_params.target_address
+                        if target == 0:
+                            lines.append("  -> NULL pointer dereference")
+                        elif target < 0x10000:
+                            lines.append(f"  -> Near-NULL address (likely null/uninitialized pointer + offset)")
+                        elif target > 0x7FFFFFFFFFFF:
+                            lines.append(f"  -> Invalid high address (likely corrupted pointer)")
+                
+                # Show any additional exception parameters
+                if report.exception_params.num_parameters > 2:
+                    lines.append(f"Additional Parameters: {report.exception_params.num_parameters - 2}")
+                    for i, param in enumerate(report.exception_params.parameters[2:], start=2):
+                        lines.append(f"  Param[{i}]: 0x{param:016X}")
+                
+                # Nested exception
+                if report.exception_params.nested_exception:
+                    nested = report.exception_params.nested_exception
+                    lines.append(f"Nested Exception: 0x{nested.code:08X} ({nested.code_name})")
+                    
+            elif report.exception_code:
+                # Fallback if we only have basic exception info
+                lines.append(f"Exception Code: 0x{report.exception_code:08X}")
+                if report.exception_address:
+                    exc_addr = report.exception_address
+                    lines.append(f"Exception Address: 0x{exc_addr:016X}")
+                    
+                    # Calculate offset from module base
+                    module_offset = None
+                    if report.exception_module:
+                        lines.append(f"Faulting Module: {report.exception_module}")
+                        
+                        # Find the module base address
+                        if report.module_versions:
+                            for mod in report.module_versions:
+                                if mod.name.lower() == report.exception_module.lower():
+                                    module_offset = exc_addr - mod.base_address
+                                    lines.append(f"Module Offset: {report.exception_module} + 0x{module_offset:X}")
+                                    break
+                        elif report.modules:
+                            for mod in report.modules:
+                                mod_name = mod.get('name', '')
+                                if mod_name.lower() == report.exception_module.lower():
+                                    module_base = mod.get('base', 0) or mod.get('baseaddress', 0)
+                                    if module_base:
+                                        module_offset = exc_addr - module_base
+                                        lines.append(f"Module Offset: {report.exception_module} + 0x{module_offset:X}")
+                                    break
+            
+            lines.append("")
+
+        # Register state at crash time
+        if report.exception_context:
+            lines.append("REGISTERS AT CRASH TIME:")
+            lines.append("-" * 40)
+            ctx = report.exception_context
+            
+            # Determine architecture and show relevant registers
+            # x64 registers
+            if 'Rip' in ctx or 'rip' in ctx:
+                rip = ctx.get('Rip') or ctx.get('rip', 0)
+                rsp = ctx.get('Rsp') or ctx.get('rsp', 0)
+                rbp = ctx.get('Rbp') or ctx.get('rbp', 0)
+                
+                lines.append(f"RIP (Instruction Pointer): 0x{rip:016X}")
+                lines.append(f"RSP (Stack Pointer):       0x{rsp:016X}")
+                lines.append(f"RBP (Base Pointer):        0x{rbp:016X}")
+                lines.append("")
+                
+                # General purpose registers
+                lines.append("General Purpose Registers:")
+                for reg in ['Rax', 'Rbx', 'Rcx', 'Rdx', 'Rsi', 'Rdi']:
+                    val = ctx.get(reg) or ctx.get(reg.lower(), 0)
+                    lines.append(f"  {reg.upper()}: 0x{val:016X}")
+                
+                # R8-R15
+                lines.append("")
+                lines.append("Extended Registers:")
+                for i in range(8, 16):
+                    reg_name = f'R{i}'
+                    val = ctx.get(reg_name) or ctx.get(reg_name.lower(), 0)
+                    lines.append(f"  {reg_name}: 0x{val:016X}")
+                
+            # x86 registers
+            elif 'Eip' in ctx or 'eip' in ctx:
+                eip = ctx.get('Eip') or ctx.get('eip', 0)
+                esp = ctx.get('Esp') or ctx.get('esp', 0)
+                ebp = ctx.get('Ebp') or ctx.get('ebp', 0)
+                
+                lines.append(f"EIP (Instruction Pointer): 0x{eip:08X}")
+                lines.append(f"ESP (Stack Pointer):       0x{esp:08X}")
+                lines.append(f"EBP (Base Pointer):        0x{ebp:08X}")
+                lines.append("")
+                
+                lines.append("General Purpose Registers:")
+                for reg in ['Eax', 'Ebx', 'Ecx', 'Edx', 'Esi', 'Edi']:
+                    val = ctx.get(reg) or ctx.get(reg.lower(), 0)
+                    lines.append(f"  {reg.upper()}: 0x{val:08X}")
+            
+            # Flags register
+            eflags = ctx.get('EFlags') or ctx.get('eflags') or ctx.get('ContextFlags') or ctx.get('contextflags')
+            if eflags:
+                lines.append("")
+                lines.append(f"Flags: 0x{eflags:08X}")
+            
+            lines.append("")
+
         # Thread information
         if report.threads_extended:
             lines.append("THREADS AT CRASH TIME:")
             lines.append("-" * 40)
-            for t in report.threads_extended[:30]:
+            
+            # Try to identify the crashing thread
+            crashing_thread_id = None
+            if report.exception_context:
+                # Some contexts have thread ID
+                crashing_thread_id = report.exception_context.get('ThreadId') or report.exception_context.get('thread_id')
+            
+            for i, t in enumerate(report.threads_extended[:30]):
                 name_str = f" \"{t.thread_name}\"" if t.thread_name else ""
                 state_str = f" [{t.state}]" if t.state else ""
-                lines.append(f"  Thread {t.thread_id}{name_str}{state_str}")
+                
+                # Mark the crashing thread
+                crash_marker = ""
+                if crashing_thread_id and t.thread_id == crashing_thread_id:
+                    crash_marker = " *** CRASHING THREAD ***"
+                elif i == 0 and not crashing_thread_id and report.exception_code:
+                    # If we can't identify crashing thread, assume it's the first one
+                    crash_marker = " *** LIKELY CRASHING THREAD ***"
+                
+                lines.append(f"  Thread {t.thread_id}{name_str}{state_str}{crash_marker}")
                 if t.priority:
                     lines.append(f"    Priority: {t.priority}")
                 if t.stack_base:
@@ -1189,6 +1402,58 @@ class CrashAnalyzerGUI(QWidget):
                 if i < len(report.js_stack_resources) and report.js_stack_resources[i]:
                     lines.append(f"  Resources involved: {', '.join(report.js_stack_resources[i])}")
                 lines.append(f"  {trace}")
+            lines.append("")
+
+        # Loaded modules section (for context with stack trace)
+        if report.module_versions or report.modules:
+            lines.append("LOADED MODULES:")
+            lines.append("-" * 40)
+            
+            # Use module_versions if available (more detailed), otherwise modules
+            module_list = []
+            if report.module_versions:
+                # Sort by base address
+                sorted_modules = sorted(report.module_versions, key=lambda m: m.base_address)
+                for mod in sorted_modules[:15]:  # Show first 15 modules
+                    base = mod.base_address
+                    end = base + mod.size - 1 if mod.size else base
+                    size_kb = mod.size // 1024 if mod.size else 0
+                    
+                    # Show version if available
+                    version_str = ""
+                    if mod.file_version:
+                        version_str = f" v{mod.file_version}"
+                    elif mod.product_version:
+                        version_str = f" v{mod.product_version}"
+                    
+                    lines.append(f"  {mod.name}{version_str}")
+                    lines.append(f"    Base: 0x{base:016X} - 0x{end:016X} ({size_kb:,} KB)")
+                    
+                    # Show PDB info if available (useful for symbol resolution)
+                    if mod.pdb_name:
+                        pdb_guid_str = f"{mod.pdb_guid}-{mod.pdb_age}" if mod.pdb_guid and mod.pdb_age else mod.pdb_guid or ""
+                        if pdb_guid_str:
+                            lines.append(f"    PDB: {mod.pdb_name} ({pdb_guid_str})")
+                
+                if len(sorted_modules) > 15:
+                    lines.append(f"  ... and {len(sorted_modules) - 15} more modules")
+            
+            elif report.modules:
+                # Fallback to basic module info
+                for i, mod in enumerate(report.modules[:15]):
+                    name = mod.get('name', 'Unknown')
+                    base = mod.get('base', 0) or mod.get('baseaddress', 0)
+                    size = mod.get('size', 0)
+                    
+                    if base:
+                        end = base + size - 1 if size else base
+                        size_kb = size // 1024 if size else 0
+                        lines.append(f"  {name}")
+                        lines.append(f"    Base: 0x{base:016X} - 0x{end:016X} ({size_kb:,} KB)")
+                
+                if len(report.modules) > 15:
+                    lines.append(f"  ... and {len(report.modules) - 15} more modules")
+            
             lines.append("")
 
         # Native stacks (symbolicated when PDBs available)

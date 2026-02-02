@@ -241,6 +241,8 @@ class Symbolicator:
     Local symbol cache: set FIVEM_SYMBOL_CACHE to a folder path (e.g. D:\\symbolcache)
     to load PDBs from disk when the server returns 404. Layout: cache/pdb_name/GUIDage/pdb_name
     or cache/pdb_name/GUID/pdb_name or cache/pdb_name (flat).
+    
+    Automatically detects FiveM installation and uses it for symbol resolution.
     """
 
     # Timeout (seconds) for symbol server requests; increase if you see timeout errors
@@ -248,6 +250,14 @@ class Symbolicator:
 
     # Fallback paths to check when FIVEM_SYMBOL_CACHE env var is not set
     _DEFAULT_CACHE_PATHS = ("D:\\symbolcache", "C:\\symbolcache")
+    
+    # FiveM installation locations to check
+    _FIVEM_INSTALL_PATHS = [
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'FiveM', 'FiveM.app'),
+        os.path.join(os.environ.get('APPDATA', ''), 'CitizenFX'),
+        "C:\\FiveM",
+        "D:\\FiveM",
+    ]
 
     def __init__(
         self,
@@ -256,17 +266,23 @@ class Symbolicator:
     ):
         self.server = symbol_server
         raw_path = (local_symbol_path or os.environ.get("FIVEM_SYMBOL_CACHE", "").strip()) or None
+        
         # Fallback: if env var not set, use first existing default path (e.g. when run from IDE, not run_analyzer.bat)
         if not raw_path and sys.platform == "win32":
             for p in self._DEFAULT_CACHE_PATHS:
                 if os.path.isdir(p):
                     raw_path = p
                     break
+        
+        # Detect FiveM installation for automatic symbol resolution
+        self.fivem_install_path = self._detect_fivem_installation()
+        
         self._local_symbol_path = os.path.normpath(raw_path) if raw_path else None
         # #region agent log
         _dlog("local_cache", "core.Symbolicator.__init__", "local symbol path", {
             "local_symbol_path": self._local_symbol_path,
             "from_env": os.environ.get("FIVEM_SYMBOL_CACHE", "").strip() or None,
+            "fivem_install_path": self.fivem_install_path,
         })
         # #endregion
         self.process = None
@@ -294,6 +310,93 @@ class Symbolicator:
             self._initialized = bool(result)
         except Exception:
             self._initialized = False
+
+    def _detect_fivem_installation(self) -> Optional[str]:
+        """Detect FiveM installation directory.
+        
+        Returns:
+            Path to FiveM installation if found, None otherwise
+        """
+        if sys.platform != 'win32':
+            return None
+        
+        for path in self._FIVEM_INSTALL_PATHS:
+            if not path:
+                continue
+            
+            try:
+                # Check if path exists and contains FiveM executables
+                if os.path.isdir(path):
+                    # Look for FiveM.exe or FiveM_*.exe files
+                    for root, dirs, files in os.walk(path):
+                        for file in files:
+                            if file.lower().startswith('fivem') and file.lower().endswith('.exe'):
+                                # Found FiveM installation
+                                return os.path.dirname(os.path.join(root, file))
+                        # Don't recurse too deep (max 3 levels)
+                        if root.count(os.sep) - path.count(os.sep) >= 3:
+                            break
+            except Exception:
+                continue
+        
+        return None
+    
+    def _find_pdb_in_fivem_install(self, pdb_name: str, build_number: Optional[str] = None) -> Optional[str]:
+        """Try to find PDB file in FiveM installation directory.
+        
+        Args:
+            pdb_name: Name of the PDB file (e.g., "FiveM_b3570_GTAProcess.pdb")
+            build_number: FiveM build number (e.g., "b3570") for targeted search
+            
+        Returns:
+            Path to PDB file if found, None otherwise
+        """
+        if not self.fivem_install_path or not os.path.isdir(self.fivem_install_path):
+            return None
+        
+        try:
+            # FiveM stores PDBs in various locations:
+            # 1. Next to the executable
+            # 2. In data/cache/symbols
+            # 3. In cache/subprocess
+            
+            search_dirs = [
+                self.fivem_install_path,
+                os.path.join(self.fivem_install_path, 'data', 'cache', 'symbols'),
+                os.path.join(self.fivem_install_path, 'cache', 'subprocess'),
+                os.path.join(self.fivem_install_path, 'data'),
+                os.path.join(self.fivem_install_path, 'cache'),
+            ]
+            
+            # If we have a build number, add build-specific directories
+            if build_number:
+                search_dirs.extend([
+                    os.path.join(self.fivem_install_path, f'cache\\subprocess\\fivem_{build_number}_game'),
+                    os.path.join(self.fivem_install_path, f'cache\\subprocess\\fivem_{build_number}'),
+                ])
+            
+            for search_dir in search_dirs:
+                if not os.path.isdir(search_dir):
+                    continue
+                
+                # Try exact match first
+                pdb_path = os.path.join(search_dir, pdb_name)
+                if os.path.isfile(pdb_path):
+                    return pdb_path
+                
+                # Try recursive search (limited depth)
+                for root, dirs, files in os.walk(search_dir):
+                    if pdb_name.lower() in [f.lower() for f in files]:
+                        return os.path.join(root, pdb_name)
+                    
+                    # Limit recursion depth
+                    if root.count(os.sep) - search_dir.count(os.sep) >= 2:
+                        break
+        
+        except Exception:
+            pass
+        
+        return None
 
     def download_symbol(self, module_name: str) -> Optional[str]:
         """Download symbol file for a module."""
@@ -456,13 +559,27 @@ class Symbolicator:
         age_str = str(int(age)) if age is not None else '0'
         combined = guid_str + age_str
 
-        # Try local symbol cache FIRST (user has PDBs locally; FiveM builds are often compatible)
+        # Extract build number from PDB name for FiveM-specific search
+        build_number = None
+        import re
+        build_match = re.search(r'_b(\d+)_', pdb_name)
+        if build_match:
+            build_number = f"b{build_match.group(1)}"
+
+        # 1. Try FiveM installation FIRST (fastest, always available locally)
+        if self.fivem_install_path:
+            fivem_pdb = self._find_pdb_in_fivem_install(pdb_name, build_number)
+            if fivem_pdb:
+                self._symbol_cache[cache_key] = fivem_pdb
+                return fivem_pdb
+
+        # 2. Try local symbol cache (user has PDBs locally; FiveM builds are often compatible)
         if self._local_symbol_path:
             found = self._try_local_cache(pdb_name, guid_str, combined, cache_key)
             if found:
                 return found
 
-        # Try symbol server (only if requests available)
+        # 3. Try symbol server (only if requests available)
         if HAS_REQUESTS and guid:
             path = f"{pdb_name}/{combined}/{pdb_name}"
             url = urllib.parse.urljoin(self.server, path)
