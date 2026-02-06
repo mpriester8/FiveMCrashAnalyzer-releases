@@ -32,7 +32,7 @@ echo Building executable...
 echo This may take a few minutes...
 echo.
 
-pyinstaller crash_analyzer.spec --clean
+python -m PyInstaller crash_analyzer.spec --clean
 
 if errorlevel 1 (
     echo.
