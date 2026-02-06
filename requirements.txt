@@ -1,0 +1,4 @@
+minidump>=0.22
+requests>=2.0
+pytest>=7.0
+PySide6>=6.0

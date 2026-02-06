@@ -1,0 +1,260 @@
+# =============================================================================
+# FiveM Crash Analyzer - Runtime Distribution .gitignore
+# =============================================================================
+# This file ONLY tracks the core analyzer package and essential runtime files.
+# All development files (docs, tests, scripts, examples, tools) are excluded.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Python - Byte-compiled / Optimized / DLL files
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# -----------------------------------------------------------------------------
+# Python - Distribution / Packaging
+# -----------------------------------------------------------------------------
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# -----------------------------------------------------------------------------
+# PyInstaller - Compiled Executables
+# -----------------------------------------------------------------------------
+*.manifest
+# Note: crash_analyzer.spec is tracked (not ignored)
+
+# -----------------------------------------------------------------------------
+# Python - Installer Logs
+# -----------------------------------------------------------------------------
+pip-log.txt
+pip-delete-this-directory.txt
+
+# -----------------------------------------------------------------------------
+# Python - Unit Test / Coverage Reports
+# -----------------------------------------------------------------------------
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+pytestdebug.log
+
+# -----------------------------------------------------------------------------
+# Python - Environments (Virtual Environments)
+# -----------------------------------------------------------------------------
+.env
+.env.local
+.venv
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+*.venv
+
+# -----------------------------------------------------------------------------
+# Python - Type Checking / Linting
+# -----------------------------------------------------------------------------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+pylint.log
+
+# -----------------------------------------------------------------------------
+# Python - Jupyter Notebook
+# -----------------------------------------------------------------------------
+.ipynb_checkpoints
+*.ipynb
+
+# -----------------------------------------------------------------------------
+# Python - Other
+# -----------------------------------------------------------------------------
+.python-version
+__pypackages__/
+celerybeat-schedule
+celerybeat.pid
+*.sage.py
+
+# -----------------------------------------------------------------------------
+# IDEs and Editors
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+.vscode-test/
+
+# -----------------------------------------------------------------------------
+# OS-Specific Files
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# -----------------------------------------------------------------------------
+# Security - API Keys, Certificates, Credentials
+# -----------------------------------------------------------------------------
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+*.p12
+*.secret
+*.credentials
+secrets/
+.env.production
+.env.*.local
+
+# -----------------------------------------------------------------------------
+# AI Agent Configuration (Internal Development Only)
+# -----------------------------------------------------------------------------
+.cursor/
+.cursorrules
+.windsurfrules
+.clinerules
+.github/copilot-instructions.md
+
+# -----------------------------------------------------------------------------
+# PROJECT-SPECIFIC: Crash Dumps (Contains User Data - NEVER COMMIT)
+# -----------------------------------------------------------------------------
+*.dmp
+*.mdmp
+crashdump/
+crash_dumps/
+dumps/
+rock near VU/
+# Any directory with "dump" in the name
+*dump*/
+*.core
+
+# -----------------------------------------------------------------------------
+# PROJECT-SPECIFIC: Analysis Output / Temporary Files
+# -----------------------------------------------------------------------------
+temp_output/
+output/
+results/
+*_analysis.txt
+*_results.txt
+*_output.txt
+*_report.txt
+recovery_test_results.json
+test_output.txt
+
+# -----------------------------------------------------------------------------
+# PROJECT-SPECIFIC: Downloaded Symbols (Large Binary Files)
+# -----------------------------------------------------------------------------
+symbols/
+*.pdb
+pdb_cache/
+symbol_cache/
+
+# -----------------------------------------------------------------------------
+# PROJECT-SPECIFIC: Development & Documentation (NOT NEEDED FOR RUNTIME)
+# -----------------------------------------------------------------------------
+# Exclude all development, testing, and documentation files
+docs/
+examples/
+scripts/
+tests/
+tools/
+archive/
+dev/
+
+# Internal/organizational documentation
+REORGANIZATION_SUMMARY.md
+ORGANIZATION_VERIFIED.md
+INTERNAL_NOTES.md
+TODO_PRIVATE.md
+PUBLIC_GITIGNORE_GUIDE.md
+NO_CONSOLE_GUIDE.md
+*.md
+# But keep essential README and LICENSE
+!README.md
+!LICENSE.md
+!LICENSE
+
+# -----------------------------------------------------------------------------
+# Logs and Databases
+# -----------------------------------------------------------------------------
+*.log - RUNTIME ESSENTIALS ONLY)
+# -----------------------------------------------------------------------------
+!requirements.txt
+!setup.py
+!crash_analyzer.spec
+!.gitignore
+!LICENSE
+!LICENSE.md
+!README.md
+!crash_analyzer_cli.py
+
+# Keep all Python files in crash_analyzer package (core code)
+!crash_analyzer/
+!crash_analyzer/*.py
+!crash_analyzer/__init__.py
+!crash_analyzer/**/*.py
+
+# Keep launchers
+!run_analyzer.bat
+!FiveM Crash Analyzer.vbs
+!build_exe.bat
+!analyze_crash.bat
+!extract_lua_natives.bat
+!apply_gitignore.ps1 (Build Artifacts)
+# -----------------------------------------------------------------------------
+*.tar
+*.tar.gz
+*.zip
+*.7z
+*.rar
+
+# -----------------------------------------------------------------------------
+# Keep These Files (Explicit Exceptions)
+# -----------------------------------------------------------------------------
+!requirements.txt
+!pytest.ini
+!setup.py
+!crash_analyzer.spec
+!.gitignore
+!LICENSE
+!README.md
