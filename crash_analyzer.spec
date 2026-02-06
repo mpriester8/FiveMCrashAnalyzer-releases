@@ -12,8 +12,8 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('crash_analyzer\\*.py', 'crash_analyzer'),
-        ('assets\\*', 'assets'),  # Include icons if they exist
+        ('crash_analyzer', 'crash_analyzer'),
+        ('assets', 'assets'),  # Include the entire assets folder with icons
     ],
     hiddenimports=[
         'PySide6.QtCore',

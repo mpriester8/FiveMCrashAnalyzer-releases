@@ -204,7 +204,18 @@ class CrashAnalyzerGUI(QWidget):
         """Set window icon for the application."""
         # Try to load icon from multiple possible locations
         # Prefer .ico for Windows for proper taskbar icon display
+        
+        # Determine the base directory based on whether app is bundled with PyInstaller
+        if getattr(sys, 'frozen', False):
+            # Running as a PyInstaller bundle
+            base_dir = sys._MEIPASS
+        else:
+            # Running as normal Python script
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
         icon_paths = [
+            os.path.join(base_dir, 'assets', 'icon.ico'),
+            os.path.join(base_dir, 'assets', 'icon.png'),
             os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'assets', 'icon.ico')),
             os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'assets', 'icon.png')),
             os.path.abspath(os.path.join(os.path.dirname(__file__), 'icon.ico')),
